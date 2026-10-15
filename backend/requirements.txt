@@ -1,0 +1,13 @@
+pydantic>=2.0
+pytest
+python-dateutil
+groq
+google-generativeai
+python-dotenv
+fastapi
+uvicorn[standard]
+supabase
+httpx
+pypdf>=4.0.0
+python-docx>=1.1.0
+python-multipart>=0.0.9
