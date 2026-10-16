@@ -5,6 +5,7 @@ API keys and database credentials are present.
 """
 
 import os
+from typing import Optional
 from dotenv import load_dotenv
 
 # Load variables from .env file if present
@@ -13,6 +14,7 @@ load_dotenv()
 # Active Groq model identifier and API key (OpenAI-compatible LLM provider)
 GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL: str = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_VISION_MODEL: str = os.getenv("GROQ_VISION_MODEL", "qwen/qwen3.8-27b")
 
 if not GROQ_API_KEY:
     raise ValueError(
@@ -28,11 +30,18 @@ GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
 # Supabase database configuration
 SUPABASE_URL: str = os.getenv("SUPABASE_URL", "")
 SUPABASE_SERVICE_KEY: str = os.getenv("SUPABASE_SERVICE_KEY", "")
+SUPABASE_JWT_SECRET: Optional[str] = os.getenv("SUPABASE_JWT_SECRET") or None
+ALLOW_ANONYMOUS_DEV: bool = os.getenv("ALLOW_ANONYMOUS_DEV", "true").lower() in ("true", "1", "yes")
 
 
 def get_groq_model() -> str:
     """Return the configured Groq model name."""
     return GROQ_MODEL
+
+
+def get_groq_vision_model() -> str:
+    """Return the configured Groq Multimodal Vision model name."""
+    return GROQ_VISION_MODEL
 
 
 def get_groq_api_key() -> str:

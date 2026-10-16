@@ -62,3 +62,11 @@ class Project(BaseModel):
         default=None,
         description="Populated error message when status == FAILED",
     )
+    owner_id: Optional[str] = Field(
+        default=None,
+        description="UUID of the user who created/owns this project",
+    )
+    owner_email: Optional[str] = Field(
+        default=None,
+        description="Email address of the project owner",
+    )

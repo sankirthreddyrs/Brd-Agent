@@ -1,4 +1,5 @@
 import axios from 'axios';
+import { supabase } from './supabase';
 
 /**
  * Base API URL resolved from environment variable VITE_API_URL,
@@ -16,6 +17,20 @@ export const apiClient = axios.create({
     'Content-Type': 'application/json',
   },
   timeout: 60000, // 60 seconds timeout for LLM analysis / compilation
+});
+
+// Request interceptor to attach active Supabase JWT
+apiClient.interceptors.request.use(async (config) => {
+  try {
+    const { data } = await supabase.auth.getSession();
+    const token = data.session?.access_token;
+    if (token) {
+      config.headers.Authorization = `Bearer ${token}`;
+    }
+  } catch {
+    // Proceed without authorization header if session lookup fails
+  }
+  return config;
 });
 
 // Response interceptor for consistent error extraction

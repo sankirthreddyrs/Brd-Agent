@@ -27,12 +27,25 @@ logger = logging.getLogger(__name__)
 MAX_FILE_SIZE_BYTES: int = 10 * 1024 * 1024  # 10,485,760 bytes
 
 # Supported file extensions
-SUPPORTED_EXTENSIONS = {"pdf", "docx", "txt", "text", "md"}
+SUPPORTED_IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "webp"}
+SUPPORTED_EXTENSIONS = {"pdf", "docx", "txt", "text", "md"} | SUPPORTED_IMAGE_EXTENSIONS
 
 # Chunking defaults: ~500 to 800 words (~1500 to 2500 characters) with 15% overlap
 DEFAULT_TARGET_WORDS: int = 600
 DEFAULT_OVERLAP_WORDS: int = 90  # 15% of 600
 MIN_CHUNK_WORDS: int = 30
+
+
+def get_image_mime_type(filename: str) -> str:
+    """Return image MIME type for supported image formats."""
+    suffix = Path(filename).suffix.lower().lstrip(".")
+    if suffix == "png":
+        return "image/png"
+    elif suffix in ("jpg", "jpeg"):
+        return "image/jpeg"
+    elif suffix == "webp":
+        return "image/webp"
+    raise ValueError(f"Unsupported image format '.{suffix}'. Supported formats: png, jpg, jpeg, webp.")
 
 
 class ParsedChunk(BaseModel):
@@ -55,7 +68,7 @@ class ParsedDocument(BaseModel):
     """Complete parsed document containing full text, chunks, and metadata."""
 
     filename: str = Field(..., description="Original filename")
-    file_type: str = Field(..., description="Normalized document type: 'pdf', 'docx', or 'txt'")
+    file_type: str = Field(..., description="Normalized document type: 'pdf', 'docx', 'txt', or 'image'")
     raw_text: str = Field(..., description="Complete extracted textual content")
     chunks: List[ParsedChunk] = Field(default_factory=list, description="Extracted chunks list")
     total_pages: Optional[int] = Field(
@@ -142,18 +155,20 @@ class DocumentParser:
         suffix = Path(filename).suffix.lower().lstrip(".")
         if not suffix:
             raise ValueError(
-                f"File '{filename}' has no extension. Supported formats are: pdf, docx, txt."
+                f"File '{filename}' has no extension. Supported formats are: pdf, docx, txt, png, jpg, jpeg, webp."
             )
 
         if suffix not in SUPPORTED_EXTENSIONS:
             raise ValueError(
                 f"Unsupported file format '.{suffix}' for '{filename}'. "
-                f"Supported formats are: pdf, docx, txt."
+                f"Supported formats are: pdf, docx, txt, png, jpg, jpeg, webp."
             )
 
         # Normalize format name
         if suffix in ("txt", "text", "md"):
             norm_type = "txt"
+        elif suffix in SUPPORTED_IMAGE_EXTENSIONS:
+            norm_type = "image"
         else:
             norm_type = suffix
 
@@ -171,6 +186,16 @@ class DocumentParser:
                     f"Invalid DOCX file signature for '{filename}'. "
                     f"File is not a valid Office Open XML ZIP package."
                 )
+        elif norm_type == "image":
+            if suffix == "png":
+                if not content_bytes.startswith(b"\x89PNG"):
+                    raise ValueError(f"Invalid PNG image signature for '{filename}'.")
+            elif suffix in ("jpg", "jpeg"):
+                if not content_bytes.startswith(b"\xff\xd8\xff"):
+                    raise ValueError(f"Invalid JPEG image signature for '{filename}'.")
+            elif suffix == "webp":
+                if not (content_bytes.startswith(b"RIFF") and b"WEBP" in content_bytes[8:12]):
+                    raise ValueError(f"Invalid WEBP image signature for '{filename}'.")
 
         return norm_type
 
@@ -255,12 +280,18 @@ class DocumentParser:
                 raise ValueError(f"Failed to decode text file '{filename}': {err}") from err
         return _clean_text(decoded)
 
-    def parse_file(self, filename: str, content_bytes: bytes) -> ParsedDocument:
+    def parse_file(
+        self,
+        filename: str,
+        content_bytes: bytes,
+        llm_client: Optional[Any] = None,
+    ) -> ParsedDocument:
         """Validate, parse, and chunk an uploaded document file.
 
         Args:
             filename: Original name of the uploaded file.
             content_bytes: Raw binary bytes of the file.
+            llm_client: Optional LLMClient required when parsing image files.
 
         Returns:
             ParsedDocument containing raw text and chunked representations.
@@ -274,6 +305,13 @@ class DocumentParser:
 
         # 2. Detect format & validate signature
         file_type = self.detect_and_validate_format(filename, content_bytes)
+
+        if file_type == "image":
+            if llm_client is None:
+                raise ValueError(
+                    f"Cannot parse image '{filename}' without an LLMClient for vision transcription."
+                )
+            return self.parse_image(filename, content_bytes, llm_client)
 
         # Compute stable document hash prefix for chunk IDs
         doc_hash = hashlib.sha256(content_bytes).hexdigest()[:8]
@@ -389,8 +427,87 @@ class DocumentParser:
             total_pages=total_pages,
         )
 
+    def parse_image(
+        self,
+        filename: str,
+        content_bytes: bytes,
+        llm_client: Any,
+    ) -> ParsedDocument:
+        """Validate, transcribe, and chunk an image document using multimodal vision OCR.
 
-def parse_file(filename: str, content_bytes: bytes) -> ParsedDocument:
+        Args:
+            filename: Original image file name (.png, .jpg, .jpeg, .webp).
+            content_bytes: Raw binary bytes of the image file.
+            llm_client: LLMClient instance implementing transcribe_image.
+
+        Returns:
+            ParsedDocument with file_type='image', total_pages=1, and chunked text.
+        """
+        self.validate_file_size(content_bytes)
+        self.detect_and_validate_format(filename, content_bytes)
+        mime_type = get_image_mime_type(filename)
+
+        raw_transcription = llm_client.transcribe_image(content_bytes, mime_type)
+        cleaned_text = _clean_text(raw_transcription or "")
+
+        doc_hash = hashlib.sha256(content_bytes).hexdigest()[:8]
+        chunks: List[ParsedChunk] = []
+
+        if cleaned_text:
+            text_slices = _chunk_text_slice(
+                cleaned_text,
+                target_words=self.target_chunk_words,
+                overlap_words=self.overlap_words,
+            )
+            for chunk_idx, slice_text in enumerate(text_slices):
+                chunk_uuid = str(uuid.uuid4())
+                chunk_label = f"CHUNK-{doc_hash}-{chunk_idx}"
+                metadata = {
+                    "id": chunk_label,
+                    "uuid": chunk_uuid,
+                    "chunk_label": chunk_label,
+                    "chunk_index": chunk_idx,
+                    "page_number": 1,
+                    "character_count": len(slice_text),
+                    "word_count": len(slice_text.split()),
+                    "filename": filename,
+                    "file_type": "image",
+                    "mime_type": mime_type,
+                }
+                chunks.append(
+                    ParsedChunk(
+                        id=chunk_uuid,
+                        chunk_index=chunk_idx,
+                        content=slice_text,
+                        page_number=1,
+                        metadata=metadata,
+                    )
+                )
+
+        return ParsedDocument(
+            filename=filename,
+            file_type="image",
+            raw_text=cleaned_text,
+            chunks=chunks,
+            total_pages=1,
+        )
+
+
+def parse_file(
+    filename: str,
+    content_bytes: bytes,
+    llm_client: Optional[Any] = None,
+) -> ParsedDocument:
     """Convenience functional wrapper for DocumentParser.parse_file."""
     parser = DocumentParser()
-    return parser.parse_file(filename, content_bytes)
+    return parser.parse_file(filename, content_bytes, llm_client=llm_client)
+
+
+def parse_image(
+    filename: str,
+    content_bytes: bytes,
+    llm_client: Any,
+) -> ParsedDocument:
+    """Convenience functional wrapper for DocumentParser.parse_image."""
+    parser = DocumentParser()
+    return parser.parse_image(filename, content_bytes, llm_client)

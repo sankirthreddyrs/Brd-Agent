@@ -117,6 +117,14 @@ class SourceDocumentResponse(BaseModel):
         default=None,
         description="Creation or upload timestamp ISO string",
     )
+    uploaded_by: Optional[str] = Field(
+        default=None,
+        description="UUID of the user who uploaded the document",
+    )
+    uploader_email: Optional[str] = Field(
+        default=None,
+        description="Email address of the uploader",
+    )
 
 
 class SourceDocumentListResponse(BaseModel):
@@ -131,6 +139,21 @@ class SourceDocumentListResponse(BaseModel):
 
 
 ProjectResponse = Project
+AssumptionResponse = Assumption
+
+
+class AnswerResponse(BaseModel):
+    """Response representing a recorded question answer with audit attribution."""
+
+    model_config = ConfigDict(use_enum_values=False)
+
+    id: str = Field(..., description="Unique answer identifier")
+    project_id: str = Field(..., description="Associated project ID")
+    question_id: str = Field(..., description="ID of the question being answered")
+    value: str = Field(..., description="Answer text or selected value")
+    answered_at: Optional[str] = Field(default=None, description="Timestamp ISO string")
+    answered_by: Optional[str] = Field(default=None, description="UUID of the answerer")
+    answerer_email: Optional[str] = Field(default=None, description="Email address of the answerer")
 
 
 class BRDVersionResponse(BaseModel):

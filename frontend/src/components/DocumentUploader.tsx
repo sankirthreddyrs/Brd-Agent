@@ -6,6 +6,8 @@ import {
   AlertCircle,
   RefreshCw,
   X,
+  Image as ImageIcon,
+  User,
 } from 'lucide-react';
 import { uploadSourceFile, getSourceFiles } from '../api/projects';
 import type { SourceDocument } from '../types';
@@ -16,7 +18,7 @@ interface DocumentUploaderProps {
 }
 
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10 MB
-const ACCEPTED_TYPES = ['.pdf', '.docx', '.txt'];
+const ACCEPTED_TYPES = ['.pdf', '.docx', '.txt', '.png', '.jpg', '.jpeg', '.webp'];
 
 
 function formatBytes(bytes: number): string {
@@ -33,6 +35,12 @@ function fileTypeIcon(fileType: string) {
       return <FileText className="w-4 h-4 text-rose-400" />;
     case 'docx':
       return <FileType2 className="w-4 h-4 text-blue-400" />;
+    case 'image':
+    case 'png':
+    case 'jpg':
+    case 'jpeg':
+    case 'webp':
+      return <ImageIcon className="w-4 h-4 text-purple-400" />;
     default:
       return <FileText className="w-4 h-4 text-slate-400" />;
   }
@@ -68,7 +76,7 @@ export default function DocumentUploader({ projectId, onUploadComplete }: Docume
     }
     const ext = '.' + file.name.split('.').pop()?.toLowerCase();
     if (!ACCEPTED_TYPES.includes(ext)) {
-      return `Unsupported file type "${ext}". Allowed: PDF, DOCX, TXT.`;
+      return `Unsupported file type "${ext}". Allowed: PDF, DOCX, TXT, PNG, JPG, WEBP.`;
     }
     return null;
   };
@@ -106,7 +114,6 @@ export default function DocumentUploader({ projectId, onUploadComplete }: Docume
     e.preventDefault();
     e.stopPropagation();
     setIsDragging(false);
-
     const files = e.dataTransfer.files;
     if (files && files.length > 0) {
       handleUpload(files[0]);
@@ -147,17 +154,19 @@ export default function DocumentUploader({ projectId, onUploadComplete }: Docume
         )}
         <div className="text-center">
           <p className={`text-sm font-medium ${isDragging ? 'text-cyan-300' : 'text-slate-300'}`}>
-            {isUploading ? 'Uploading & Parsing...' : 'Drop files here or click to browse'}
+            {isUploading
+              ? 'Uploading & Parsing...'
+              : 'Drop documents or whiteboard photos here (PDF, DOCX, TXT, PNG, JPG — Max 10MB)'}
           </p>
           <p className="text-xs text-slate-500 mt-1">
-            Supported: PDF, DOCX, TXT — Max 10 MB
+            Supports PDF, DOCX, TXT, and Whiteboard Images (.png, .jpg, .webp) up to 10 MB
           </p>
         </div>
         <input
           ref={fileInputRef}
           id="file-input"
           type="file"
-          accept=".pdf,.docx,.txt"
+          accept=".pdf,.docx,.txt,.png,.jpg,.jpeg,.webp"
           onChange={handleFileSelect}
           className="hidden"
         />
@@ -201,42 +210,70 @@ export default function DocumentUploader({ projectId, onUploadComplete }: Docume
           </div>
         ) : (
           <div className="space-y-1.5">
-            {documents.map((doc) => (
-              <div
-                key={doc.id}
-                id={`source-doc-${doc.id}`}
-                className="flex items-center gap-3 p-2.5 rounded-lg bg-slate-900/50 border border-slate-800/60 group hover:border-slate-700 transition"
-              >
-                {fileTypeIcon(doc.file_type)}
-                <div className="flex-1 min-w-0">
-                  <p className="text-xs font-medium text-slate-200 truncate">
-                    {doc.filename}
-                  </p>
-                  <div className="flex items-center gap-2 text-[10px] text-slate-500 mt-0.5">
-                    <span className="uppercase font-semibold">{doc.file_type}</span>
-                    {doc.file_size_bytes && (
-                      <>
-                        <span>•</span>
-                        <span>{formatBytes(doc.file_size_bytes)}</span>
-                      </>
-                    )}
-                    <span>•</span>
-                    <span>{doc.chunk_count} chunks</span>
-                  </div>
-                </div>
-                <span
-                  className={`text-[10px] font-semibold px-2 py-0.5 rounded-full border ${
-                    doc.status === 'READY'
-                      ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30'
-                      : doc.status === 'FAILED'
-                      ? 'bg-rose-500/10 text-rose-400 border-rose-500/30'
-                      : 'bg-amber-500/10 text-amber-400 border-amber-500/30'
-                  }`}
+            {documents.map((doc) => {
+              const isImage =
+                doc.file_type === 'image' ||
+                ['png', 'jpg', 'jpeg', 'webp'].includes(doc.file_type?.toLowerCase());
+
+              return (
+                <div
+                  key={doc.id}
+                  id={`source-doc-${doc.id}`}
+                  className="flex items-center gap-3 p-2.5 rounded-lg bg-slate-900/50 border border-slate-800/60 group hover:border-slate-700 transition"
                 >
-                  {doc.status}
-                </span>
-              </div>
-            ))}
+                  {fileTypeIcon(doc.file_type)}
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2">
+                      <p className="text-xs font-medium text-slate-200 truncate">
+                        {doc.filename}
+                      </p>
+                      {isImage && (
+                        <span className="inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded-full bg-purple-950/60 text-purple-300 border border-purple-500/30">
+                          <ImageIcon className="w-2.5 h-2.5 text-purple-400" />
+                          Whiteboard / Diagram
+                        </span>
+                      )}
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2 text-[10px] text-slate-500 mt-1">
+                      <span className="uppercase font-semibold">{doc.file_type}</span>
+                      {doc.file_size_bytes && (
+                        <>
+                          <span>•</span>
+                          <span>{formatBytes(doc.file_size_bytes)}</span>
+                        </>
+                      )}
+                      <span>•</span>
+                      <span>{doc.chunk_count} chunks</span>
+                      {(doc.uploader_email || doc.uploaded_by) && (
+                        <>
+                          <span>•</span>
+                          <span
+                            className="inline-flex items-center gap-1 text-[10px] text-slate-400 bg-slate-800/60 px-1.5 py-0.5 rounded border border-slate-700/50"
+                            title={`Uploaded by ${doc.uploader_email || doc.uploaded_by}`}
+                          >
+                            <User className="w-2.5 h-2.5 text-slate-400" />
+                            <span className="truncate max-w-[120px]">
+                              {doc.uploader_email || doc.uploaded_by}
+                            </span>
+                          </span>
+                        </>
+                      )}
+                    </div>
+                  </div>
+                  <span
+                    className={`text-[10px] font-semibold px-2 py-0.5 rounded-full border ${
+                      doc.status === 'READY'
+                        ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30'
+                        : doc.status === 'FAILED'
+                        ? 'bg-rose-500/10 text-rose-400 border-rose-500/30'
+                        : 'bg-amber-500/10 text-amber-400 border-amber-500/30'
+                    }`}
+                  >
+                    {doc.status}
+                  </span>
+                </div>
+              );
+            })}
           </div>
         )}
       </div>

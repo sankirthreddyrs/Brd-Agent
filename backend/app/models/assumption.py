@@ -3,7 +3,9 @@
 Defines assumptions made to resolve unanswerable gaps or standard architectural defaults.
 """
 
+from datetime import datetime
 from enum import Enum
+from typing import Optional
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -35,6 +37,9 @@ class Assumption(BaseModel):
         impact: Consequence level if this assumption turns out false.
         status: Current status (PROPOSED, ACCEPTED, REJECTED, SUPERSEDED).
         linked_requirement_ids: List of requirement IDs directly dependent on this assumption.
+        reviewed_by: User UUID who accepted or rejected the assumption.
+        reviewer_email: Email address of the reviewer.
+        reviewed_at: Timestamp when review decision was recorded.
     """
 
     model_config = ConfigDict(use_enum_values=False)
@@ -57,4 +62,16 @@ class Assumption(BaseModel):
     linked_requirement_ids: list[str] = Field(
         default_factory=list,
         description="IDs of requirements linked to this assumption",
+    )
+    reviewed_by: Optional[str] = Field(
+        default=None,
+        description="UUID of the user who accepted or rejected the assumption",
+    )
+    reviewer_email: Optional[str] = Field(
+        default=None,
+        description="Email address of the reviewer",
+    )
+    reviewed_at: Optional[datetime] = Field(
+        default=None,
+        description="Timestamp when the assumption decision was recorded",
     )

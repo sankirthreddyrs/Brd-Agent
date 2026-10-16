@@ -40,7 +40,12 @@ class InMemoryProjectRepository:
         self.brd_versions: dict[str, list[BRDDocumentVersion]] = {}
 
     def create_project(
-        self, title: str, idea: str, project_id: Optional[str] = None
+        self,
+        title: str,
+        idea: str,
+        project_id: Optional[str] = None,
+        owner_id: Optional[str] = None,
+        owner_email: Optional[str] = None,
     ) -> Project:
         pid = project_id or str(uuid.uuid4())
         now = datetime.now(timezone.utc)
@@ -54,6 +59,8 @@ class InMemoryProjectRepository:
             "last_error": None,
             "created_at": now,
             "updated_at": now,
+            "owner_id": owner_id,
+            "owner_email": owner_email,
         }
         self.requirements[pid] = []
         self.questions[pid] = []
@@ -75,11 +82,20 @@ class InMemoryProjectRepository:
             raise ValueError(f"Project with id '{project_id}' not found.")
         return self._to_project(self.projects[project_id])
 
-    def list_projects(self, limit: int = 20) -> list[Project]:
+    def list_projects(
+        self, limit: int = 20, owner_id: Optional[str] = None
+    ) -> list[Project]:
         sorted_projs = sorted(
             self.projects.values(), key=lambda p: p["created_at"], reverse=True
         )
+        if owner_id:
+            sorted_projs = [
+                p for p in sorted_projs
+                if p.get("owner_id") == owner_id or p.get("owner_id") is None
+            ]
         return [self._to_project(p) for p in sorted_projs[:limit]]
+
+    get_projects = list_projects
 
     def update_project(self, project: Project) -> Project:
         if project.id not in self.projects:
@@ -248,6 +264,10 @@ class InMemoryProjectRepository:
 
         return list(answers)
 
+    def save_answer(self, project_id: str, answer: Answer) -> Answer:
+        saved = self.save_answers(project_id, [answer])
+        return saved[0]
+
     def get_answers(self, project_id: str) -> list[Answer]:
         return list(self.answers.get(project_id, []))
 
@@ -264,16 +284,48 @@ class InMemoryProjectRepository:
         return list(self.assumptions.get(project_id, []))
 
     def update_assumption_status(
-        self, project_id: str, assumption_id: str, status: Union[AssumptionStatus, str]
+        self,
+        project_id: str,
+        assumption_id: str,
+        status: Union[AssumptionStatus, str],
+        reviewed_by: Optional[str] = None,
+        reviewer_email: Optional[str] = None,
+        reviewed_at: Optional[datetime] = None,
     ) -> Assumption:
         asms = self.assumptions.get(project_id, [])
         status_val = status.value if hasattr(status, "value") else str(status)
+        rev_dt = reviewed_at or datetime.now(timezone.utc)
         for idx, a in enumerate(asms):
             if a.id == assumption_id:
-                updated = a.model_copy(update={"status": AssumptionStatus(status_val)})
+                updated = a.model_copy(
+                    update={
+                        "status": AssumptionStatus(status_val),
+                        "reviewed_by": reviewed_by,
+                        "reviewer_email": reviewer_email,
+                        "reviewed_at": rev_dt,
+                    }
+                )
                 asms[idx] = updated
                 return updated
         raise ValueError(f"Assumption '{assumption_id}' not found.")
+
+    def record_assumption_decision(
+        self,
+        project_id: str,
+        assumption_id: str,
+        status: Union[AssumptionStatus, str],
+        reviewed_by: Optional[str] = None,
+        reviewer_email: Optional[str] = None,
+        reviewed_at: Optional[datetime] = None,
+    ) -> Assumption:
+        return self.update_assumption_status(
+            project_id=project_id,
+            assumption_id=assumption_id,
+            status=status,
+            reviewed_by=reviewed_by,
+            reviewer_email=reviewer_email,
+            reviewed_at=reviewed_at,
+        )
 
     def save_validation_issues(
         self, project_id: str, validation_result: ValidationResult
@@ -357,6 +409,8 @@ class InMemoryProjectRepository:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             last_error=row.get("last_error"),
+            owner_id=row.get("owner_id"),
+            owner_email=row.get("owner_email"),
         )
 
 

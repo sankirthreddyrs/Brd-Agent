@@ -17,7 +17,10 @@ import {
   ShieldCheck,
   FileDown,
   Table2,
+  LogOut,
 } from 'lucide-react';
+import type { User as SupabaseUser } from '@supabase/supabase-js';
+import { supabase } from './api/supabase';
 import {
   checkHealth,
   getProjects,
@@ -41,6 +44,7 @@ import ClarificationQuestions from './components/ClarificationQuestions';
 import AssumptionReview from './components/AssumptionReview';
 import RequirementsTable from './components/RequirementsTable';
 import BRDViewer from './components/BRDViewer';
+import AuthModal from './components/AuthModal';
 
 // ─── Shared Status Badge Utility ───────────────────────────────
 function getStatusBadge(status: ProjectStatus) {
@@ -74,6 +78,10 @@ interface TabDef {
 
 // ─── Main Application ──────────────────────────────────────────
 export default function App() {
+  // Auth
+  const [currentUser, setCurrentUser] = useState<SupabaseUser | null>(null);
+  const [isAuthLoading, setIsAuthLoading] = useState(true);
+
   // Health
   const [isBackendHealthy, setIsBackendHealthy] = useState<boolean | null>(null);
   const [isCheckingHealth, setIsCheckingHealth] = useState(false);
@@ -136,6 +144,36 @@ export default function App() {
     }
   }, []);
 
+  // ─── Supabase Auth Listener ──────────────────────────────────
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      setCurrentUser(session?.user ?? null);
+      setIsAuthLoading(false);
+    });
+
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((_event, session) => {
+      const newUser = session?.user ?? null;
+      setCurrentUser(newUser);
+      setIsAuthLoading(false);
+      if (!newUser) {
+        // Clear project state cleanly on logout / user switch
+        setSelectedProject(null);
+        setProjects([]);
+        setRequirements([]);
+        setOpenQuestions([]);
+        setAssumptions([]);
+      } else {
+        fetchProjects();
+      }
+    });
+
+    return () => {
+      subscription.unsubscribe();
+    };
+  }, [fetchProjects]);
+
   // ─── Load project-specific entity state ──────────────────────
   const loadProjectData = useCallback(async (projectId: string) => {
     try {
@@ -163,10 +201,12 @@ export default function App() {
   // ─── Initial load & heartbeat ────────────────────────────────
   useEffect(() => {
     pingHealth();
-    fetchProjects();
+    if (currentUser) {
+      fetchProjects();
+    }
     const interval = setInterval(pingHealth, 30000);
     return () => clearInterval(interval);
-  }, [pingHealth, fetchProjects]);
+  }, [pingHealth, fetchProjects, currentUser]);
 
   // ─── Update helpers ──────────────────────────────────────────
   const updateProject = (updated: Project) => {
@@ -316,9 +356,52 @@ export default function App() {
               <Plus className="w-3.5 h-3.5" />
               New Project
             </button>
+
+            {/* Logged in User Profile & Sign Out */}
+            {currentUser && (
+              <div className="flex items-center gap-2 pl-3 border-l border-slate-800">
+                <div
+                  id="user-profile-badge"
+                  className="flex items-center gap-2 px-2.5 py-1 rounded-lg bg-slate-800/80 border border-slate-700/60 text-xs text-slate-300"
+                >
+                  <div className="w-5 h-5 rounded-full bg-gradient-to-tr from-cyan-500 to-indigo-500 flex items-center justify-center text-white text-[10px] font-bold">
+                    {currentUser.email ? currentUser.email[0].toUpperCase() : 'U'}
+                  </div>
+                  <span
+                    className="max-w-[120px] sm:max-w-[180px] truncate font-medium text-slate-200"
+                    title={currentUser.email || ''}
+                  >
+                    {currentUser.email}
+                  </span>
+                </div>
+                <button
+                  id="btn-sign-out"
+                  onClick={async () => {
+                    await supabase.auth.signOut();
+                    showNotification('success', 'Signed out successfully');
+                  }}
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium text-slate-400 hover:text-rose-400 hover:bg-rose-950/30 border border-transparent hover:border-rose-500/30 transition-all cursor-pointer"
+                  title="Sign out of workspace"
+                >
+                  <LogOut className="w-3.5 h-3.5" />
+                  <span className="hidden sm:inline">Sign Out</span>
+                </button>
+              </div>
+            )}
           </div>
         </div>
       </header>
+
+      {/* ═══════════════════ AUTH MODAL ═══════════════════ */}
+      {!isAuthLoading && !currentUser && (
+        <AuthModal
+          isOpen={true}
+          onSuccess={() => {
+            showNotification('success', 'Authenticated successfully! Loading workspace...');
+            fetchProjects();
+          }}
+        />
+      )}
 
       {/* ═══════════════════ TOAST ═══════════════════ */}
       {notification && (

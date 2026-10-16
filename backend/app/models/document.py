@@ -40,9 +40,9 @@ class SourceDocument(BaseModel):
     id: str = Field(..., description="Unique document identifier")
     project_id: str = Field(..., description="Associated project ID")
     filename: str = Field(..., description="Original filename")
-    file_type: Literal["pdf", "docx", "txt"] = Field(
+    file_type: Literal["pdf", "docx", "txt", "image"] = Field(
         ...,
-        description="Supported file format (pdf, docx, txt)",
+        description="Supported file format (pdf, docx, txt, image)",
     )
     status: SourceDocumentStatus = Field(
         ...,
@@ -63,6 +63,14 @@ class SourceDocument(BaseModel):
     created_at: Optional[Union[datetime, str]] = Field(
         default=None,
         description="Timestamp when document was created or uploaded",
+    )
+    uploaded_by: Optional[str] = Field(
+        default=None,
+        description="UUID of the user who uploaded this document",
+    )
+    uploader_email: Optional[str] = Field(
+        default=None,
+        description="Email address of the uploader",
     )
 
 

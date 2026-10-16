@@ -49,6 +49,8 @@ class ProjectRepository:
         title: str,
         idea: str,
         project_id: Optional[str] = None,
+        owner_id: Optional[str] = None,
+        owner_email: Optional[str] = None,
     ) -> Project:
         """Create and persist a new Project in DRAFT status.
 
@@ -56,6 +58,8 @@ class ProjectRepository:
             title: Human-readable title for the project.
             idea: Raw business idea text.
             project_id: Optional specific UUID string; generated if None.
+            owner_id: Optional UUID of the user who owns the project.
+            owner_email: Optional email address of the owner.
 
         Returns:
             Project domain model.
@@ -75,6 +79,8 @@ class ProjectRepository:
             "last_error": None,
             "created_at": now.isoformat(),
             "updated_at": now.isoformat(),
+            "owner_id": owner_id,
+            "owner_email": owner_email,
         }
 
         try:
@@ -122,19 +128,24 @@ class ProjectRepository:
             logger.error("Error retrieving project '%s': %s", project_id, exc)
             raise ValueError(f"Failed to retrieve project '{project_id}': {exc}") from exc
 
-    def list_projects(self, limit: int = 20) -> list[Project]:
-        """List recently updated projects.
+    def list_projects(
+        self, limit: int = 20, owner_id: Optional[str] = None
+    ) -> list[Project]:
+        """List recently updated projects, optionally filtered by owner_id.
 
         Args:
             limit: Maximum count to return.
+            owner_id: Optional user UUID to filter projects by owner.
 
         Returns:
             List of Project models.
         """
         try:
+            query = self.client.table("projects").select("*")
+            if owner_id:
+                query = query.eq("owner_id", owner_id)
             res = (
-                self.client.table("projects")
-                .select("*")
+                query
                 .order("created_at", desc=True)
                 .limit(limit)
                 .execute()
@@ -143,6 +154,9 @@ class ProjectRepository:
         except Exception as exc:
             logger.error("Error listing projects: %s", exc)
             raise ValueError(f"Failed to list projects: {exc}") from exc
+
+    # Alias for naming consistency across callers
+    get_projects = list_projects
 
     def update_project(self, project: Project) -> Project:
         """Update mutable fields of a project.
@@ -510,6 +524,8 @@ class ProjectRepository:
                 "question_id": a.question_id,
                 "value": a.value,
                 "answered_at": (a.answered_at or datetime.now(timezone.utc)).isoformat(),
+                "answered_by": a.answered_by,
+                "answerer_email": a.answerer_email,
             }
             for a in answers
         ]
@@ -527,6 +543,11 @@ class ProjectRepository:
         except Exception as exc:
             logger.error("Failed to save answers for project '%s': %s", project_id, exc)
             raise ValueError(f"Failed to save answers: {exc}") from exc
+
+    def save_answer(self, project_id: str, answer: Answer) -> Answer:
+        """Persist a single Answer model."""
+        saved = self.save_answers(project_id, [answer])
+        return saved[0]
 
     def get_answers(self, project_id: str) -> list[Answer]:
         """Retrieve all answers submitted for a project."""
@@ -596,23 +617,41 @@ class ProjectRepository:
             raise ValueError(f"Failed to get assumptions: {exc}") from exc
 
     def update_assumption_status(
-        self, project_id: str, assumption_id: str, status: Union[AssumptionStatus, str]
+        self,
+        project_id: str,
+        assumption_id: str,
+        status: Union[AssumptionStatus, str],
+        reviewed_by: Optional[str] = None,
+        reviewer_email: Optional[str] = None,
+        reviewed_at: Optional[datetime] = None,
     ) -> Assumption:
-        """Update an assumption's review status (e.g. ACCEPTED or REJECTED).
+        """Update an assumption's review status (e.g. ACCEPTED or REJECTED) with audit attribution.
 
         Args:
             project_id: Associated project UUID.
             assumption_id: Target assumption ID.
             status: New AssumptionStatus.
+            reviewed_by: Optional UUID of the reviewing user.
+            reviewer_email: Optional email of the reviewing user.
+            reviewed_at: Optional timestamp when the decision was made.
 
         Returns:
             Updated Assumption model.
         """
         status_val = status.value if hasattr(status, "value") else str(status)
+        rev_dt = reviewed_at or datetime.now(timezone.utc)
+        update_data: dict[str, Any] = {"status": status_val}
+        if reviewed_by is not None:
+            update_data["reviewed_by"] = reviewed_by
+        if reviewer_email is not None:
+            update_data["reviewer_email"] = reviewer_email
+        if rev_dt is not None:
+            update_data["reviewed_at"] = rev_dt.isoformat()
+
         try:
             res = (
                 self.client.table("assumptions")
-                .update({"status": status_val})
+                .update(update_data)
                 .eq("id", assumption_id)
                 .eq("project_id", project_id)
                 .execute()
@@ -632,6 +671,25 @@ class ProjectRepository:
                 exc,
             )
             raise ValueError(f"Failed to update assumption: {exc}") from exc
+
+    def record_assumption_decision(
+        self,
+        project_id: str,
+        assumption_id: str,
+        status: Union[AssumptionStatus, str],
+        reviewed_by: Optional[str] = None,
+        reviewer_email: Optional[str] = None,
+        reviewed_at: Optional[datetime] = None,
+    ) -> Assumption:
+        """Record an assumption decision with reviewer audit attribution."""
+        return self.update_assumption_status(
+            project_id=project_id,
+            assumption_id=assumption_id,
+            status=status,
+            reviewed_by=reviewed_by,
+            reviewer_email=reviewer_email,
+            reviewed_at=reviewed_at,
+        )
 
     # ------------------------------------------------------------------
     # Validation Issues Persistence
@@ -742,6 +800,8 @@ class ProjectRepository:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             last_error=row.get("last_error"),
+            owner_id=row.get("owner_id"),
+            owner_email=row.get("owner_email"),
         )
 
     @staticmethod
@@ -784,10 +844,23 @@ class ProjectRepository:
             question_id=row["question_id"],
             value=row["value"],
             answered_at=row.get("answered_at") or datetime.now(timezone.utc),
+            answered_by=row.get("answered_by"),
+            answerer_email=row.get("answerer_email"),
         )
 
     @staticmethod
     def _row_to_assumption(row: dict[str, Any]) -> Assumption:
+        rev_at = row.get("reviewed_at")
+        if isinstance(rev_at, str):
+            try:
+                rev_dt = datetime.fromisoformat(rev_at.replace("Z", "+00:00"))
+            except Exception:
+                rev_dt = None
+        elif isinstance(rev_at, datetime):
+            rev_dt = rev_at
+        else:
+            rev_dt = None
+
         return Assumption(
             id=row["id"],
             project_id=str(row.get("project_id", "")),
@@ -796,6 +869,9 @@ class ProjectRepository:
             impact=ImpactLevel(row["impact"]),
             status=AssumptionStatus(row.get("status", AssumptionStatus.PROPOSED.value)),
             linked_requirement_ids=row.get("linked_requirement_ids") or [],
+            reviewed_by=row.get("reviewed_by"),
+            reviewer_email=row.get("reviewer_email"),
+            reviewed_at=rev_dt,
         )
 
     # ------------------------------------------------------------------
@@ -962,7 +1038,7 @@ class ProjectRepository:
 
     @staticmethod
     def _source_document_to_row(doc: SourceDocument) -> dict[str, Any]:
-        return {
+        row = {
             "id": doc.id,
             "project_id": doc.project_id,
             "filename": doc.filename,
@@ -970,7 +1046,17 @@ class ProjectRepository:
             "status": doc.status.value if isinstance(doc.status, SourceDocumentStatus) else str(doc.status),
             "storage_path": doc.storage_path,
             "error_message": doc.error_message,
+            "file_size_bytes": doc.file_size_bytes,
+            "uploaded_by": doc.uploaded_by,
+            "uploader_email": doc.uploader_email,
         }
+        if doc.created_at:
+            row["created_at"] = (
+                doc.created_at.isoformat()
+                if isinstance(doc.created_at, datetime)
+                else str(doc.created_at)
+            )
+        return row
 
     @staticmethod
     def _row_to_source_document(row: dict[str, Any]) -> SourceDocument:
@@ -993,6 +1079,8 @@ class ProjectRepository:
             error_message=row.get("error_message"),
             file_size_bytes=row.get("file_size_bytes"),
             created_at=str(row["created_at"]) if row.get("created_at") else None,
+            uploaded_by=row.get("uploaded_by"),
+            uploader_email=row.get("uploader_email"),
         )
 
     @staticmethod

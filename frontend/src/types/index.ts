@@ -23,6 +23,8 @@ export interface Project {
   created_at: string;
   updated_at: string;
   last_error?: string | null;
+  owner_id?: string | null;
+  owner_email?: string | null;
 }
 
 export type RequirementType = 'functional' | 'nonfunctional' | 'business' | 'constraint';
@@ -72,6 +74,9 @@ export interface Assumption {
   impact: ImpactLevel;
   status: AssumptionStatus;
   linked_requirement_ids: string[];
+  reviewed_by?: string | null;
+  reviewer_email?: string | null;
+  reviewed_at?: string | null;
 }
 
 export interface BRDVersion {
@@ -88,11 +93,13 @@ export interface SourceDocument {
   id: string;
   project_id: string;
   filename: string;
-  file_type: 'pdf' | 'docx' | 'txt' | string;
+  file_type: 'pdf' | 'docx' | 'txt' | 'image' | string;
   file_size_bytes?: number | null;
   status: string;
   chunk_count: number;
   created_at?: string | null;
+  uploaded_by?: string | null;
+  uploader_email?: string | null;
 }
 
 export interface ValidationIssue {

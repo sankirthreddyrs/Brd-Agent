@@ -1,6 +1,7 @@
 """Answer domain models for user responses to clarification questions."""
 
 from datetime import datetime
+from typing import Optional
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -13,6 +14,8 @@ class Answer(BaseModel):
         question_id: Identifier of the answered question.
         value: Textual or selected response value.
         answered_at: Timestamp when the response was provided.
+        answered_by: User UUID who submitted the response.
+        answerer_email: Email address of the user who submitted the response.
     """
 
     model_config = ConfigDict(use_enum_values=False)
@@ -24,4 +27,12 @@ class Answer(BaseModel):
     answered_at: datetime = Field(
         ...,
         description="Timestamp when the answer was recorded",
+    )
+    answered_by: Optional[str] = Field(
+        default=None,
+        description="UUID of the user who answered the question",
+    )
+    answerer_email: Optional[str] = Field(
+        default=None,
+        description="Email address of the user who answered the question",
     )

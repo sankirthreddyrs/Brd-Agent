@@ -4,6 +4,7 @@ Provides a provider-neutral interface for structured Pydantic generation
 backed by Groq API (e.g. Llama-3.3-70b-versatile).
 """
 
+import base64
 import copy
 import json
 import logging
@@ -209,6 +210,97 @@ class LLMClient:
                     f"Failed to generate valid {response_schema.__name__} from Groq after retry. "
                     f"Validation error: {second_error}. Raw output: {retry_raw}"
                 ) from second_error
+
+    def transcribe_image(self, image_bytes: bytes, mime_type: str) -> str:
+        """Transcribe a whiteboard photo, architecture diagram, or handwritten note into Markdown.
+
+        Base64-encodes image_bytes, sends payload with data URI to Groq Multimodal Vision model,
+        and returns detailed structured Markdown.
+
+        Args:
+            image_bytes: Raw binary bytes of the image file.
+            mime_type: MIME type of the image (e.g. 'image/png', 'image/jpeg', 'image/webp').
+
+        Returns:
+            Extracted detailed Markdown text transcription.
+        """
+        b64_str = base64.b64encode(image_bytes).decode("utf-8")
+        data_uri = f"data:{mime_type};base64,{b64_str}"
+        prompt = (
+            "You are an expert technical business analyst and OCR transcription specialist. "
+            "Transcribe this whiteboard photo or architecture diagram into structured, detailed Markdown. "
+            "Capture all handwritten notes, system boxes, workflow flows, actors, requirements, bullets, "
+            "and constraints. Do not summarize or omit technical specifics; preserve all diagrams as text "
+            "flowcharts (e.g. A -> B)."
+        )
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": data_uri},
+                    },
+                ],
+            },
+        ]
+
+        vision_model = getattr(config, "GROQ_VISION_MODEL", "qwen/qwen3.8-27b")
+        delay = 2.0
+        max_retries = 2
+        for attempt in range(max_retries + 1):
+            try:
+                response = self.client.chat.completions.create(
+                    model=vision_model,
+                    messages=messages,
+                    temperature=0.2,
+                    max_tokens=4096,
+                )
+                return response.choices[0].message.content or ""
+            except (RateLimitError, APIConnectionError, APIError) as api_err:
+                err_msg = str(api_err).lower()
+                if (
+                    "model_not_found" in err_msg
+                    or "decommissioned" in err_msg
+                    or "not supported" in err_msg
+                ) and attempt < max_retries:
+                    preferred_vision_fallbacks = [
+                        "qwen/qwen3.8-27b",
+                        "meta-llama/llama-4-scout-17b-16e-instruct",
+                    ]
+                    for candidate in preferred_vision_fallbacks:
+                        if candidate != vision_model:
+                            logger.warning(
+                                "Groq vision model '%s' unavailable (%s). Switching to fallback vision model '%s'.",
+                                vision_model,
+                                api_err,
+                                candidate,
+                            )
+                            vision_model = candidate
+                            break
+
+                if attempt < max_retries:
+                    logger.warning(
+                        "Groq Vision API call attempt %d failed: %s. Backing off for %.1f seconds...",
+                        attempt + 1,
+                        api_err,
+                        delay,
+                    )
+                    time.sleep(delay)
+                    delay *= 2.0
+                else:
+                    logger.error(
+                        "Groq Vision API call failed after %d retries: %s",
+                        max_retries,
+                        api_err,
+                    )
+                    raise RuntimeError(
+                        f"Groq Vision API call failed after {max_retries} retries: {api_err}"
+                    ) from api_err
+            except Exception as unhandled_err:
+                logger.error("Unexpected error during Groq Vision chat completion: %s", unhandled_err)
+                raise unhandled_err
 
 
 # Backward compatibility alias

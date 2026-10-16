@@ -2,12 +2,19 @@
 
 from datetime import datetime, timezone
 import logging
+from pathlib import Path
 from typing import Optional
 import uuid
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile, status
 
-from app.api.deps import get_gemini_client, get_repository
+from app.api.deps import (
+    AuthenticatedUser,
+    get_current_user,
+    get_gemini_client,
+    get_llm_client,
+    get_repository,
+)
 from app.api.schemas_api import (
     AnalyzeResponse,
     AssumptionDecisionRequest,
@@ -48,8 +55,9 @@ router = APIRouter(prefix="/projects", tags=["projects"])
 def create_project(
     request: CreateProjectRequest,
     repository: ProjectRepository = Depends(get_repository),
+    current_user: AuthenticatedUser = Depends(get_current_user),
 ) -> CreateProjectResponse:
-    """Initialize a new project in DRAFT status with input_revision=1."""
+    """Initialize a new project in DRAFT status with input_revision=1 and audit owner."""
     title = request.title
     if not title or not title.strip():
         # Derive concise default title from first 7 words of idea
@@ -59,7 +67,12 @@ def create_project(
             title += "..."
 
     try:
-        project = repository.create_project(title=title, idea=request.idea)
+        project = repository.create_project(
+            title=title,
+            idea=request.idea,
+            owner_id=current_user.user_id,
+            owner_email=current_user.email,
+        )
         return CreateProjectResponse(project=project)
     except ValueError as err:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(err))
@@ -73,10 +86,11 @@ def create_project(
 def list_projects(
     limit: int = Query(default=20, ge=1, le=100),
     repository: ProjectRepository = Depends(get_repository),
+    current_user: AuthenticatedUser = Depends(get_current_user),
 ) -> list[Project]:
-    """Retrieve recent projects ordered by creation date descending."""
+    """Retrieve recent projects owned by the authenticated user ordered by creation date descending."""
     try:
-        return repository.list_projects(limit=limit)
+        return repository.list_projects(limit=limit, owner_id=current_user.user_id)
     except ValueError as err:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(err))
 
@@ -119,8 +133,10 @@ async def upload_source(
     project_id: str,
     file: UploadFile = File(...),
     repository: ProjectRepository = Depends(get_repository),
+    current_user: AuthenticatedUser = Depends(get_current_user),
+    llm_client: LLMClient = Depends(get_llm_client),
 ) -> SourceDocumentResponse:
-    """Upload and process a source document (PDF, DOCX, TXT), parse chunks, and persist."""
+    """Upload and process a source document (PDF, DOCX, TXT, PNG, JPG, JPEG, WEBP), parse chunks, and persist."""
     # 1. Guard against invalid project IDs
     try:
         project = repository.get_project(project_id)
@@ -167,11 +183,15 @@ async def upload_source(
             detail="Uploaded file is empty.",
         )
 
-    # 4. Parse and chunk file using DocumentParser
+    # 4. Parse and chunk file using DocumentParser (with multimodal vision if image)
     filename = file.filename or "uploaded_document.txt"
     parser = DocumentParser()
+    suffix = Path(filename).suffix.lower().lstrip(".")
     try:
-        parsed_doc = parser.parse_file(filename, content_bytes)
+        if suffix in {"png", "jpg", "jpeg", "webp"}:
+            parsed_doc = parser.parse_image(filename, content_bytes, llm_client)
+        else:
+            parsed_doc = parser.parse_file(filename, content_bytes)
     except ValueError as err:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -197,6 +217,8 @@ async def upload_source(
         error_message=None,
         file_size_bytes=len(content_bytes),
         created_at=now.isoformat(),
+        uploaded_by=current_user.user_id,
+        uploader_email=current_user.email,
     )
 
     source_chunks: list[SourceChunk] = []
@@ -252,6 +274,8 @@ async def upload_source(
         status=saved_doc.status.value if isinstance(saved_doc.status, SourceDocumentStatus) else str(saved_doc.status),
         chunk_count=len(source_chunks),
         created_at=created_at_str,
+        uploaded_by=saved_doc.uploaded_by,
+        uploader_email=saved_doc.uploader_email,
     )
 
 
@@ -443,7 +467,8 @@ def submit_answers(
     project_id: str,
     request: SubmitAnswersRequest,
     repository: ProjectRepository = Depends(get_repository),
-    gemini_client: GeminiClient = Depends(get_gemini_client),
+    gemini_client: LLMClient = Depends(get_gemini_client),
+    current_user: AuthenticatedUser = Depends(get_current_user),
 ) -> SubmitAnswersResponse:
     """Submit answers, increment input_revision, transition via answers_submitted, and re-run analysis."""
     try:
@@ -462,7 +487,7 @@ def submit_answers(
         )
 
     try:
-        # 1. Create and persist Answer models
+        # 1. Create and persist Answer models with user audit attribution
         now = datetime.now(timezone.utc)
         answer_models = [
             Answer(
@@ -471,6 +496,8 @@ def submit_answers(
                 question_id=item.question_id,
                 value=item.value,
                 answered_at=now,
+                answered_by=current_user.user_id,
+                answerer_email=current_user.email,
             )
             for item in request.answers
         ]
@@ -577,8 +604,9 @@ def decide_assumption(
     assumption_id: str,
     request: AssumptionDecisionRequest,
     repository: ProjectRepository = Depends(get_repository),
+    current_user: AuthenticatedUser = Depends(get_current_user),
 ) -> Assumption:
-    """Accept or reject an assumption, updating revision and triggering question on rejection."""
+    """Accept or reject an assumption, updating revision, recording reviewer audit, and triggering question on rejection."""
     try:
         project = repository.get_project(project_id)
     except ValueError as err:
@@ -591,11 +619,15 @@ def decide_assumption(
         else AssumptionStatus.REJECTED
     )
 
+    now = datetime.now(timezone.utc)
     try:
         updated_asm = repository.update_assumption_status(
             project_id=project_id,
             assumption_id=assumption_id,
             status=new_status,
+            reviewed_by=current_user.user_id,
+            reviewer_email=current_user.email,
+            reviewed_at=now,
         )
         repository.increment_input_revision(project_id)
 

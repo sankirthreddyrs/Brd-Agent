@@ -8,6 +8,8 @@ import {
   RefreshCw,
   Link2,
   AlertTriangle,
+  UserCheck,
+  Clock,
 } from 'lucide-react';
 import { getAssumptions, decideAssumption } from '../api/projects';
 import type { Assumption, ImpactLevel, AssumptionStatus } from '../types';
@@ -54,6 +56,21 @@ function impactConfig(impact: ImpactLevel) {
       return { cls: 'bg-amber-500/10 text-amber-400 border-amber-500/30', label: 'Medium Risk' };
     default:
       return { cls: 'bg-slate-500/10 text-slate-400 border-slate-500/30', label: 'Low Risk' };
+  }
+}
+
+function formatDate(dateStr?: string | null): string {
+  if (!dateStr) return '';
+  try {
+    const d = new Date(dateStr);
+    return d.toLocaleDateString(undefined, {
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+  } catch {
+    return dateStr;
   }
 }
 
@@ -201,6 +218,25 @@ export default function AssumptionReview({ projectId, onDecisionMade }: Assumpti
                         {rid}
                       </span>
                     ))}
+                  </div>
+                )}
+
+                {/* Reviewer Attribution Badge */}
+                {(asm.reviewed_by || asm.reviewer_email) && (
+                  <div className="flex items-center gap-1.5 text-[11px] text-cyan-300 bg-cyan-950/40 border border-cyan-500/20 px-2.5 py-1 rounded-md w-fit">
+                    <UserCheck className="w-3.5 h-3.5 text-cyan-400" />
+                    <span>
+                      Reviewed by{' '}
+                      <span className="font-semibold text-white">
+                        {asm.reviewer_email || asm.reviewed_by}
+                      </span>
+                      {asm.reviewed_at && (
+                        <span className="text-slate-400 ml-1.5 inline-flex items-center gap-1">
+                          <Clock className="w-2.5 h-2.5 text-slate-500" />
+                          {formatDate(asm.reviewed_at)}
+                        </span>
+                      )}
+                    </span>
                   </div>
                 )}
 
