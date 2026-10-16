@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from typing import Optional, Sequence
 import uuid
 
-from app.llm.gemini_client import GeminiClient
+from app.llm.llm_client import LLMClient, GeminiClient
 from app.llm.prompts import build_question_text_prompt
 from app.llm.schemas import QuestionDraft
 from app.models.assumption import Assumption, AssumptionStatus, ImpactLevel
@@ -60,11 +60,12 @@ def _determine_gap_confidence(
 def issues_to_questions(
     issues: Sequence[ValidationIssue],
     requirements: Sequence[Requirement],
-    gemini_client: GeminiClient,
+    gemini_client: Optional[LLMClient] = None,
     already_asked_field_paths: Optional[set[str]] = None,
     project_id: str = "project-default",
+    llm_client: Optional[LLMClient] = None,
 ) -> list[Question]:
-    """Transform BLOCKER validation issues into prioritized Question objects using Gemini.
+    """Transform BLOCKER validation issues into prioritized Question objects using LLM.
 
     Skips WARNING issues (which become assumptions) and skips field paths
     that have already been asked in prior iterations.
@@ -72,13 +73,15 @@ def issues_to_questions(
     Args:
         issues: List of validation issues from rule evaluation.
         requirements: List of existing requirements.
-        gemini_client: Client used to draft non-technical question phrasing.
+        gemini_client: Client used to draft non-technical question phrasing (legacy parameter).
         already_asked_field_paths: Set of dot-notated field paths already queried.
         project_id: Parent project identifier.
+        llm_client: Provider-neutral LLMClient instance.
 
     Returns:
         List of generated Question objects sorted by priority.
     """
+    client = llm_client or gemini_client or LLMClient()
     already_asked = already_asked_field_paths or set()
     req_map = {r.id: r for r in requirements}
     questions: list[Question] = []
@@ -99,12 +102,12 @@ def issues_to_questions(
         impact = IMPACT_LOOKUP.get(issue.code, 2)
         gap_confidence = _determine_gap_confidence(issue, related_req)
 
-        # Call Gemini to draft stakeholder question phrasing
+        # Call LLM to draft stakeholder question phrasing
         prompt = build_question_text_prompt(
             issue=issue,
             related_requirement=related_req,
         )
-        draft: QuestionDraft = gemini_client.generate_structured(
+        draft: QuestionDraft = client.generate_structured(
             prompt=prompt,
             response_schema=QuestionDraft,
         )

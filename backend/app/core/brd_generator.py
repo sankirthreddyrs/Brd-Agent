@@ -11,7 +11,7 @@ import logging
 from typing import Any, Optional, Sequence
 import uuid
 
-from app.llm.gemini_client import GeminiClient
+from app.llm.llm_client import LLMClient, GeminiClient
 from app.models.assumption import Assumption, AssumptionStatus
 from app.models.document import BRDDocumentVersion, SourceDocument
 from app.models.project import Project
@@ -23,13 +23,19 @@ logger = logging.getLogger(__name__)
 class BRDGenerator:
     """Compiles confirmed requirements, assumptions, and traces into a complete BRD document."""
 
-    def __init__(self, gemini_client: Optional[GeminiClient] = None) -> None:
+    def __init__(
+        self,
+        gemini_client: Optional[LLMClient] = None,
+        llm_client: Optional[LLMClient] = None,
+    ) -> None:
         """Initialize generator with an optional LLM client for executive summary synthesis.
 
         Args:
-            gemini_client: Optional GeminiClient instance. If omitted, uses deterministic synthesis.
+            gemini_client: Optional legacy client instance.
+            llm_client: Optional provider-neutral LLMClient instance.
         """
-        self.gemini_client = gemini_client
+        self.gemini_client = llm_client or gemini_client
+        self.llm_client = self.gemini_client
 
     def check_traceability_quality(
         self,

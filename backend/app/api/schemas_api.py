@@ -81,7 +81,7 @@ class SubmitAnswersResponse(BaseModel):
 class AssumptionDecisionRequest(BaseModel):
     """Payload to accept or reject an explicit assumption."""
 
-    decision: Literal["accepted", "rejected"] = Field(
+    decision: Literal["accepted", "rejected", "ACCEPTED", "REJECTED"] = Field(
         ...,
         description="Review decision ('accepted' or 'rejected').",
     )

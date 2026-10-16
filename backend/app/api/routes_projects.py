@@ -27,7 +27,7 @@ from app.core.docx_renderer import render_brd_to_docx
 from app.core.orchestrator import BRDOrchestrator
 from app.core.state_machine import InvalidTransitionError
 from app.db.repository import ProjectRepository
-from app.llm.gemini_client import GeminiClient
+from app.llm.llm_client import LLMClient, GeminiClient
 from app.models.answer import Answer
 from app.models.assumption import Assumption, AssumptionStatus
 from app.models.document import SourceChunk, SourceDocument, SourceDocumentStatus
@@ -584,9 +584,10 @@ def decide_assumption(
     except ValueError as err:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(err))
 
+    decision_str = request.decision.lower()
     new_status = (
         AssumptionStatus.ACCEPTED
-        if request.decision == "accepted"
+        if decision_str == "accepted"
         else AssumptionStatus.REJECTED
     )
 
@@ -599,7 +600,7 @@ def decide_assumption(
         repository.increment_input_revision(project_id)
 
         # If rejected, create an open question to capture stakeholder input
-        if request.decision == "rejected":
+        if decision_str == "rejected":
             new_question = Question(
                 id=f"Q-ASM-{uuid.uuid4().hex[:6].upper()}",
                 project_id=project_id,

@@ -23,7 +23,7 @@ from app.core.validation_rules import (
     validate_project_completeness,
     validate_requirements,
 )
-from app.llm.gemini_client import GeminiClient
+from app.llm.llm_client import LLMClient, GeminiClient
 from app.models.answer import Answer
 from app.models.assumption import Assumption
 from app.models.document import SourceChunk
@@ -63,13 +63,19 @@ class WorkflowResult(BaseModel):
 class BRDOrchestrator:
     """Orchestrates requirement extraction, validation, and clarification cycles."""
 
-    def __init__(self, gemini_client: Optional[GeminiClient] = None) -> None:
-        """Initialize the orchestrator with a Gemini client.
+    def __init__(
+        self,
+        gemini_client: Optional[LLMClient] = None,
+        llm_client: Optional[LLMClient] = None,
+    ) -> None:
+        """Initialize the orchestrator with an LLM client.
 
         Args:
-            gemini_client: Configured Gemini client instance. If None, instantiates default.
+            gemini_client: Configured legacy Gemini client instance.
+            llm_client: Configured provider-neutral LLM client instance.
         """
-        self.gemini_client = gemini_client or GeminiClient()
+        self.gemini_client = llm_client or gemini_client or LLMClient()
+        self.llm_client = self.gemini_client
 
     def run_analysis(
         self,

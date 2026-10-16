@@ -2,7 +2,7 @@ import logging
 from typing import Optional, Sequence
 import uuid
 
-from app.llm.gemini_client import GeminiClient
+from app.llm.llm_client import LLMClient, GeminiClient
 from app.llm.prompts import build_extraction_prompt
 from app.llm.schemas import ExtractionResult
 from app.models.assumption import Assumption
@@ -17,8 +17,9 @@ def extract_requirements(
     existing_requirements: Optional[Sequence[Requirement]] = None,
     answered_context: Optional[str] = None,
     chunks: Optional[Sequence[SourceChunk]] = None,
-    gemini_client: Optional[GeminiClient] = None,
+    gemini_client: Optional[LLMClient] = None,
     project_id: str = "project-default",
+    llm_client: Optional[LLMClient] = None,
 ) -> tuple[list[Requirement], list[Assumption]]:
     """Extract candidate requirements and proposed assumptions from a business idea and source chunks.
 
@@ -31,13 +32,14 @@ def extract_requirements(
         existing_requirements: Collection of previously extracted requirements, if any.
         answered_context: Serialized text of answered clarification questions.
         chunks: Optional collection of source document chunks for grounding.
-        gemini_client: Configured LLM client instance. If None, instantiates default.
+        gemini_client: Configured LLM client instance (legacy parameter).
         project_id: Associated project identifier.
+        llm_client: Configured provider-neutral LLM client instance.
 
     Returns:
         Tuple of (list of Requirement, list of Assumption).
     """
-    client = gemini_client or GeminiClient()
+    client = llm_client or gemini_client or LLMClient()
     existing_reqs = list(existing_requirements) if existing_requirements else []
     valid_chunks = list(chunks) if chunks else []
 

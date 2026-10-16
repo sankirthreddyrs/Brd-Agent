@@ -1,6 +1,6 @@
 """LLM client, prompt templates, and structured schemas package."""
 
-from .gemini_client import GeminiClient
+from .llm_client import LLMClient, GeminiClient
 from .prompts import (
     build_extraction_prompt,
     build_gap_analysis_prompt,
@@ -14,6 +14,7 @@ from .schemas import (
 )
 
 __all__ = [
+    "LLMClient",
     "GeminiClient",
     "build_extraction_prompt",
     "build_gap_analysis_prompt",
