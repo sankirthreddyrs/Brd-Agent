@@ -25,6 +25,8 @@ export interface Project {
   last_error?: string | null;
   owner_id?: string | null;
   owner_email?: string | null;
+  collaborator_count?: number;
+  is_owner?: boolean;
 }
 
 export type RequirementType = 'functional' | 'nonfunctional' | 'business' | 'constraint';
@@ -165,3 +167,74 @@ export interface BRDGenerateResponse {
 export interface HealthResponse {
   status: string;
 }
+
+export interface ChatMessage {
+  role: 'user' | 'assistant' | 'system';
+  content: string;
+  timestamp?: string | null;
+}
+
+export interface ChatRequest {
+  message: string;
+  history?: ChatMessage[];
+}
+
+export interface ChatResponse {
+  reply: string;
+  answered_question_id?: string | null;
+  project_status: string;
+  open_question_count: number;
+  is_ready_to_generate: boolean;
+}
+
+export interface UserProfileResponse {
+  id: string;
+  email: string;
+  full_name?: string | null;
+  role_title?: string | null;
+  avatar_url?: string | null;
+}
+
+export interface UserProfileUpdateRequest {
+  full_name?: string;
+  role_title?: string;
+  avatar_url?: string;
+}
+
+export interface CollaboratorResponse {
+  id: string;
+  project_id: string;
+  user_id: string;
+  user_email: string;
+  full_name?: string | null;
+  role: string;
+  created_at?: string | null;
+}
+
+export interface ChatMessageRecord {
+  id: string;
+  project_id: string;
+  sender_id?: string | null;
+  sender_email: string;
+  sender_name?: string | null;
+  role: string;
+  content: string;
+  created_at: string;
+}
+
+export interface ChatHistoryResponse {
+  messages: ChatMessageRecord[];
+}
+
+export interface InvitationResponse {
+  id: string;
+  project_id: string;
+  project_title?: string | null;
+  inviter_email: string;
+  invitee_email: string;
+  role: string;
+  status: string;
+  created_at: string;
+}
+
+

@@ -6,7 +6,11 @@ from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.api.routes_projects import router as projects_router
+from app.api.routes_projects import (
+    invitations_router,
+    router as projects_router,
+    user_router,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -49,6 +53,9 @@ app.add_middleware(
 
 # Include route handlers
 app.include_router(projects_router)
+app.include_router(user_router)
+app.include_router(invitations_router)
+
 
 
 @app.exception_handler(ValueError)

@@ -96,6 +96,8 @@ class ProjectDetailResponse(BaseModel):
     requirement_count: int = Field(default=0)
     open_question_count: int = Field(default=0)
     assumption_count: int = Field(default=0)
+    collaborator_count: int = Field(default=0)
+    is_owner: bool = Field(default=True)
 
 
 class SourceDocumentResponse(BaseModel):
@@ -178,4 +180,125 @@ class BRDGenerateResponse(BaseModel):
     project: Project
     brd_version: BRDVersionResponse
     download_url: str = Field(..., description="Relative download URL for DOCX artifact")
+
+
+class ChatMessage(BaseModel):
+    """Message item in the conversational clarification interview."""
+
+    model_config = ConfigDict(use_enum_values=False)
+
+    role: str = Field(..., description="Message sender role: 'user', 'assistant', or 'system'")
+    content: str = Field(..., description="Message text content")
+    timestamp: Optional[str] = Field(default=None, description="Optional timestamp string")
+
+
+class ChatRequest(BaseModel):
+    """Request payload for conversational clarification interview chat."""
+
+    model_config = ConfigDict(use_enum_values=False)
+
+    message: str = Field(..., min_length=1, description="Latest message from user")
+    history: list[ChatMessage] = Field(
+        default_factory=list,
+        description="Prior conversation history",
+    )
+
+
+class ChatResponse(BaseModel):
+    """Response returned by the conversational clarification assistant."""
+
+    model_config = ConfigDict(use_enum_values=False)
+
+    reply: str = Field(..., description="Conversational reply from the AI assistant")
+    answered_question_id: Optional[str] = Field(
+        default=None,
+        description="ID of the open question resolved by user's message, if any",
+    )
+    project_status: str = Field(..., description="Current status of the project")
+    open_question_count: int = Field(..., description="Number of remaining open clarification questions")
+    is_ready_to_generate: bool = Field(..., description="True if project is ready to generate")
+
+
+class UserProfileResponse(BaseModel):
+    """Authenticated user profile metadata."""
+
+    model_config = ConfigDict(use_enum_values=False)
+
+    id: str = Field(..., description="User UUID")
+    email: str = Field(..., description="User email address")
+    full_name: Optional[str] = Field(default=None, description="User full display name")
+    role_title: Optional[str] = Field(default=None, description="User organizational role title")
+    avatar_url: Optional[str] = Field(default=None, description="User avatar image URL")
+
+
+class UserProfileUpdateRequest(BaseModel):
+    """Payload to update current user's profile."""
+
+    model_config = ConfigDict(use_enum_values=False)
+
+    full_name: Optional[str] = Field(default=None, description="User full display name")
+    role_title: Optional[str] = Field(default=None, description="User organizational role title")
+    avatar_url: Optional[str] = Field(default=None, description="User avatar image URL")
+
+
+class CollaboratorResponse(BaseModel):
+    """Team collaborator attached to a project."""
+
+    model_config = ConfigDict(use_enum_values=False)
+
+    id: str = Field(..., description="Unique collaborator membership ID")
+    project_id: str = Field(..., description="Project ID")
+    user_id: str = Field(..., description="Collaborator user UUID")
+    user_email: str = Field(..., description="Collaborator email address")
+    full_name: Optional[str] = Field(default=None, description="Collaborator display name")
+    role: str = Field(default="editor", description="Collaborator access role (e.g. editor, viewer)")
+    created_at: Optional[str] = Field(default=None, description="Enrollment timestamp ISO string")
+
+
+class ChatMessageRecord(BaseModel):
+    """Stored conversational chat message record."""
+
+    model_config = ConfigDict(use_enum_values=False)
+
+    id: str = Field(..., description="Unique chat message ID")
+    project_id: str = Field(..., description="Project ID")
+    sender_id: Optional[str] = Field(default=None, description="User UUID of sender (None for assistant)")
+    sender_email: str = Field(..., description="Email address of sender")
+    sender_name: Optional[str] = Field(default=None, description="Display name of sender")
+    role: str = Field(..., description="Role of sender: 'user' or 'assistant'")
+    content: str = Field(..., description="Message text content")
+    created_at: str = Field(..., description="ISO creation timestamp")
+
+
+class ChatHistoryResponse(BaseModel):
+    """Collection of stored chat messages for a project."""
+
+    model_config = ConfigDict(use_enum_values=False)
+
+    messages: list[ChatMessageRecord] = Field(default_factory=list, description="List of chat messages ordered chronologically")
+
+
+class InviteCollaboratorRequest(BaseModel):
+    """Payload to invite a team collaborator via email."""
+
+    model_config = ConfigDict(use_enum_values=False)
+
+    email: str = Field(..., description="Invitee email address")
+    role: Optional[str] = Field(default="editor", description="Collaborator access role")
+
+
+class InvitationResponse(BaseModel):
+    """Project invitation metadata record."""
+
+    model_config = ConfigDict(use_enum_values=False)
+
+    id: str = Field(..., description="Invitation UUID")
+    project_id: str = Field(..., description="Project ID")
+    project_title: Optional[str] = Field(default=None, description="Title of the invited project")
+    inviter_email: str = Field(..., description="Email of inviting user")
+    invitee_email: str = Field(..., description="Email of invited user")
+    role: str = Field(default="editor", description="Collaborator role")
+    status: str = Field(default="pending", description="Invitation status (pending, accepted, declined)")
+    created_at: str = Field(..., description="ISO creation timestamp")
+
 

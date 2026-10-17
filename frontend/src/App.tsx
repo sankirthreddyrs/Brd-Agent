@@ -18,6 +18,9 @@ import {
   FileDown,
   Table2,
   LogOut,
+  Users,
+  Mail,
+  Check,
 } from 'lucide-react';
 import type { User as SupabaseUser } from '@supabase/supabase-js';
 import { supabase } from './api/supabase';
@@ -28,6 +31,12 @@ import {
   analyzeProject,
   getQuestions,
   getAssumptions,
+  getRequirements,
+  getProjectDetail,
+  getUserProfile,
+  joinProject,
+  getUserInvitations,
+  acceptInvitation,
 } from './api/projects';
 import type {
   Project,
@@ -37,7 +46,10 @@ import type {
   Assumption,
   AnalyzeResponse,
   SubmitAnswersResponse,
+  UserProfileResponse,
+  InvitationResponse,
 } from './types';
+
 
 import DocumentUploader from './components/DocumentUploader';
 import ClarificationQuestions from './components/ClarificationQuestions';
@@ -45,6 +57,10 @@ import AssumptionReview from './components/AssumptionReview';
 import RequirementsTable from './components/RequirementsTable';
 import BRDViewer from './components/BRDViewer';
 import AuthModal from './components/AuthModal';
+import ClarificationChatDrawer from './components/ClarificationChatDrawer';
+import UserProfileModal from './components/UserProfileModal';
+import ShareProjectModal from './components/ShareProjectModal';
+
 
 // ─── Shared Status Badge Utility ───────────────────────────────
 function getStatusBadge(status: ProjectStatus) {
@@ -98,6 +114,27 @@ export default function App() {
   const [assumptions, setAssumptions] = useState<Assumption[]>([]);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
 
+  // AI Clarification Chat
+  const [isChatOpen, setIsChatOpen] = useState(false);
+
+  // User Profile & Team Modals
+  const [userProfile, setUserProfile] = useState<UserProfileResponse | null>(null);
+  const [isProfileModalOpen, setIsProfileModalOpen] = useState(false);
+  const [isShareModalOpen, setIsShareModalOpen] = useState(false);
+
+  // Pending user invitations
+  const [pendingInvitations, setPendingInvitations] = useState<InvitationResponse[]>([]);
+
+
+  // URL search parameter join handling
+  const [pendingJoinId, setPendingJoinId] = useState<string | null>(() => {
+    if (typeof window !== 'undefined') {
+      const params = new URLSearchParams(window.location.search);
+      return params.get('join');
+    }
+    return null;
+  });
+
   // Workspace tab
   const [activeTab, setActiveTab] = useState<WorkspaceTab>('inputs');
 
@@ -144,11 +181,88 @@ export default function App() {
     }
   }, []);
 
+  // ─── User Profile ───────────────────────────────────────────
+  const fetchUserProfile = useCallback(async () => {
+    try {
+      const prof = await getUserProfile();
+      setUserProfile(prof);
+    } catch {
+      // silently ignore
+    }
+  }, []);
+
+  // ─── Project Invitations ────────────────────────────────────
+  const fetchUserInvitations = useCallback(async () => {
+    try {
+      const invs = await getUserInvitations();
+      setPendingInvitations(invs);
+    } catch {
+      // silently ignore
+    }
+  }, []);
+
+  const handleAcceptInvitation = useCallback(
+    async (inv: InvitationResponse) => {
+      try {
+        showNotification('success', `Accepting invitation to ${inv.project_title || 'project'}...`);
+        const acceptedProj = await acceptInvitation(inv.id);
+        showNotification('success', `Joined project: ${acceptedProj.title}!`);
+        setPendingInvitations((prev) => prev.filter((i) => i.id !== inv.id));
+        await fetchProjects();
+        setSelectedProject(acceptedProj);
+        setActiveTab('inputs');
+      } catch (err: any) {
+        showNotification('error', `Failed to accept invitation: ${err.message || 'Unknown error'}`);
+      }
+    },
+    [fetchProjects]
+  );
+
+  const handleDismissInvitation = useCallback((invId: string) => {
+    setPendingInvitations((prev) => prev.filter((i) => i.id !== invId));
+  }, []);
+
+  // ─── Share Link Join Project ─────────────────────────────────
+  const handleJoinProject = useCallback(
+    async (joinId: string) => {
+      try {
+        showNotification('success', 'Joining project via invite link...');
+        const joinedProj = await joinProject(joinId);
+        showNotification('success', `Joined project: ${joinedProj.title}!`);
+
+        // Clear ?join=<id> query param from URL without page reload
+        if (typeof window !== 'undefined') {
+          const url = new URL(window.location.href);
+          url.searchParams.delete('join');
+          window.history.replaceState({}, '', url.pathname + (url.search || ''));
+        }
+        setPendingJoinId(null);
+
+        // Refresh project list and select joined project
+        await fetchProjects();
+        setSelectedProject(joinedProj);
+        setActiveTab('inputs');
+      } catch (err: any) {
+        showNotification('error', `Failed to join project: ${err.message || 'Unknown error'}`);
+        setPendingJoinId(null);
+      }
+    },
+    [fetchProjects]
+  );
+
   // ─── Supabase Auth Listener ──────────────────────────────────
   useEffect(() => {
     supabase.auth.getSession().then(({ data: { session } }) => {
-      setCurrentUser(session?.user ?? null);
+      const user = session?.user ?? null;
+      setCurrentUser(user);
       setIsAuthLoading(false);
+      if (user) {
+        fetchUserProfile();
+        fetchUserInvitations();
+        if (pendingJoinId) {
+          handleJoinProject(pendingJoinId);
+        }
+      }
     });
 
     const {
@@ -164,25 +278,39 @@ export default function App() {
         setRequirements([]);
         setOpenQuestions([]);
         setAssumptions([]);
+        setUserProfile(null);
+        setPendingInvitations([]);
       } else {
         fetchProjects();
+        fetchUserProfile();
+        fetchUserInvitations();
+        if (pendingJoinId) {
+          handleJoinProject(pendingJoinId);
+        }
       }
     });
 
     return () => {
       subscription.unsubscribe();
     };
-  }, [fetchProjects]);
+  }, [fetchProjects, fetchUserProfile, fetchUserInvitations, handleJoinProject, pendingJoinId]);
 
   // ─── Load project-specific entity state ──────────────────────
   const loadProjectData = useCallback(async (projectId: string) => {
     try {
-      const [qs, asms] = await Promise.all([
+      const [qs, asms, reqs, detail] = await Promise.all([
         getQuestions(projectId).catch(() => [] as Question[]),
         getAssumptions(projectId).catch(() => [] as Assumption[]),
+        getRequirements(projectId).catch(() => [] as Requirement[]),
+        getProjectDetail(projectId).catch(() => null),
       ]);
       setOpenQuestions(qs);
       setAssumptions(asms);
+      setRequirements(reqs);
+      if (detail?.project) {
+        setSelectedProject(detail.project);
+        setProjects((prev) => prev.map((p) => (p.id === detail.project.id ? detail.project : p)));
+      }
     } catch {
       // silently ignore
     }
@@ -203,12 +331,18 @@ export default function App() {
     pingHealth();
     if (currentUser) {
       fetchProjects();
+      fetchUserInvitations();
     }
-    const interval = setInterval(pingHealth, 30000);
+    const interval = setInterval(() => {
+      pingHealth();
+      if (currentUser) {
+        fetchUserInvitations();
+      }
+    }, 30000);
     return () => clearInterval(interval);
-  }, [pingHealth, fetchProjects, currentUser]);
-
+  }, [pingHealth, fetchProjects, fetchUserInvitations, currentUser]);
   // ─── Update helpers ──────────────────────────────────────────
+
   const updateProject = (updated: Project) => {
     setSelectedProject(updated);
     setProjects((prev) => prev.map((p) => (p.id === updated.id ? updated : p)));
@@ -360,20 +494,27 @@ export default function App() {
             {/* Logged in User Profile & Sign Out */}
             {currentUser && (
               <div className="flex items-center gap-2 pl-3 border-l border-slate-800">
-                <div
+                <button
                   id="user-profile-badge"
-                  className="flex items-center gap-2 px-2.5 py-1 rounded-lg bg-slate-800/80 border border-slate-700/60 text-xs text-slate-300"
+                  onClick={() => setIsProfileModalOpen(true)}
+                  className="flex items-center gap-2 px-2.5 py-1 rounded-lg bg-slate-800/80 hover:bg-slate-800 border border-slate-700/60 hover:border-cyan-500/40 text-xs text-slate-300 transition cursor-pointer"
+                  title="Click to view and edit profile settings"
                 >
                   <div className="w-5 h-5 rounded-full bg-gradient-to-tr from-cyan-500 to-indigo-500 flex items-center justify-center text-white text-[10px] font-bold">
-                    {currentUser.email ? currentUser.email[0].toUpperCase() : 'U'}
+                    {(userProfile?.full_name ? userProfile.full_name[0] : (currentUser.email ? currentUser.email[0] : 'U')).toUpperCase()}
                   </div>
                   <span
                     className="max-w-[120px] sm:max-w-[180px] truncate font-medium text-slate-200"
-                    title={currentUser.email || ''}
+                    title={userProfile?.full_name || currentUser.email || ''}
                   >
-                    {currentUser.email}
+                    {userProfile?.full_name || currentUser.email}
                   </span>
-                </div>
+                  {userProfile?.role_title && (
+                    <span className="hidden md:inline-block text-[10px] px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/30">
+                      {userProfile.role_title}
+                    </span>
+                  )}
+                </button>
                 <button
                   id="btn-sign-out"
                   onClick={async () => {
@@ -399,9 +540,15 @@ export default function App() {
           onSuccess={() => {
             showNotification('success', 'Authenticated successfully! Loading workspace...');
             fetchProjects();
+            fetchUserProfile();
+            fetchUserInvitations();
+            if (pendingJoinId) {
+              handleJoinProject(pendingJoinId);
+            }
           }}
         />
       )}
+
 
       {/* ═══════════════════ TOAST ═══════════════════ */}
       {notification && (
@@ -420,6 +567,64 @@ export default function App() {
 
       {/* ═══════════════════ MAIN ═══════════════════ */}
       <main className="flex-1 max-w-7xl w-full mx-auto p-6 z-10 flex flex-col gap-6">
+        {/* Pending Project Invitations Banner */}
+        {pendingInvitations.length > 0 && (
+          <div
+            id="invitations-banner"
+            className="flex flex-col gap-2.5 p-4 rounded-xl bg-gradient-to-r from-indigo-950/70 via-slate-900/80 to-brand-950/70 border border-indigo-500/40 shadow-xl backdrop-blur-md animate-fade-in"
+          >
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2 text-indigo-300 font-semibold text-xs tracking-wide uppercase">
+                <Mail className="w-4 h-4 text-cyan-400" />
+                <span>
+                  Pending Workspace {pendingInvitations.length === 1 ? 'Invitation' : 'Invitations'} ({pendingInvitations.length})
+                </span>
+              </div>
+            </div>
+
+            <div className="space-y-2">
+              {pendingInvitations.map((inv) => (
+                <div
+                  key={inv.id}
+                  className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 p-3 rounded-lg bg-slate-950/60 border border-indigo-500/30 text-xs"
+                >
+                  <div className="flex items-center gap-3 min-w-0">
+                    <div className="w-8 h-8 rounded-lg bg-indigo-500/20 border border-indigo-500/40 flex items-center justify-center text-cyan-300 shrink-0 font-bold">
+                      {(inv.project_title ? inv.project_title[0] : 'P').toUpperCase()}
+                    </div>
+                    <div className="min-w-0">
+                      <p className="text-white font-semibold text-sm truncate">
+                        {inv.project_title || 'Untitled Project'}
+                      </p>
+                      <p className="text-slate-400 text-[11px] truncate">
+                        Invited by <span className="text-indigo-300">{inv.inviter_email}</span> as{' '}
+                        <span className="font-semibold text-slate-300 capitalize">{inv.role}</span>
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-2 shrink-0">
+                    <button
+                      onClick={() => handleAcceptInvitation(inv)}
+                      className="px-3.5 py-1.5 rounded-lg bg-gradient-to-r from-emerald-600 to-cyan-600 hover:from-emerald-500 hover:to-cyan-500 text-white font-semibold text-xs flex items-center gap-1.5 shadow-md shadow-emerald-500/20 transition cursor-pointer"
+                    >
+                      <Check className="w-3.5 h-3.5" />
+                      Accept
+                    </button>
+                    <button
+                      onClick={() => handleDismissInvitation(inv.id)}
+                      className="px-2.5 py-1.5 rounded-lg text-slate-400 hover:text-slate-200 hover:bg-slate-800 transition text-xs"
+                      title="Dismiss notice"
+                    >
+                      Dismiss
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
         {/* Offline banner */}
         {isBackendHealthy === false && (
           <div id="connection-warning-banner" className="flex items-center justify-between p-4 rounded-xl bg-rose-950/40 border border-rose-500/30 text-rose-200 text-sm">
@@ -438,6 +643,7 @@ export default function App() {
             </button>
           </div>
         )}
+
 
         {/* Stats row */}
         <section className="grid grid-cols-1 md:grid-cols-3 gap-4">
@@ -544,7 +750,7 @@ export default function App() {
                 {/* Project header bar */}
                 <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4 border-b border-slate-800/80">
                   <div>
-                    <div className="flex items-center gap-3">
+                    <div className="flex items-center flex-wrap gap-2.5">
                       <h2 className="text-xl font-bold text-white tracking-tight">{selectedProject.title}</h2>
                       {(() => {
                         const b = getStatusBadge(selectedProject.status);
@@ -555,24 +761,81 @@ export default function App() {
                           </span>
                         );
                       })()}
+                      <button
+                        id="btn-share-project-header"
+                        onClick={() => setIsShareModalOpen(true)}
+                        className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-slate-800/90 hover:bg-slate-700/80 border border-slate-700/80 hover:border-cyan-500/40 text-slate-200 text-xs font-medium transition cursor-pointer shadow-sm"
+                        title="Share project invite link and manage team collaborators"
+                      >
+                        <Users className="w-3.5 h-3.5 text-cyan-400" />
+                        <span>Share / Invite</span>
+                        {(selectedProject.collaborator_count ?? 0) > 0 && (
+                          <span className="text-[10px] px-1.5 py-0.2 rounded-full bg-cyan-500/20 text-cyan-300 border border-cyan-500/30">
+                            {selectedProject.collaborator_count}
+                          </span>
+                        )}
+                      </button>
                     </div>
+
                     <p className="text-xs text-slate-400 mt-1 font-mono">
                       ID: {selectedProject.id} • Rev {selectedProject.input_revision}
                     </p>
                   </div>
-                  <button
-                    id="btn-analyze-project"
-                    onClick={handleAnalyze}
-                    disabled={isAnalyzing}
-                    className="px-4 py-2 rounded-xl bg-gradient-to-r from-brand-600 to-indigo-600 hover:from-brand-500 hover:to-indigo-500 text-white text-xs font-semibold shadow-lg shadow-brand-500/20 flex items-center gap-2 transition disabled:opacity-50"
-                  >
-                    {isAnalyzing ? (
-                      <><RefreshCw className="w-3.5 h-3.5 animate-spin" /> Analyzing...</>
-                    ) : (
-                      <><Sparkles className="w-3.5 h-3.5 text-cyan-300" /> Run Analysis</>
-                    )}
-                  </button>
+                  <div className="flex items-center gap-2">
+                    <button
+                      id="btn-open-chat-interviewer"
+                      onClick={() => setIsChatOpen(true)}
+                      className={`px-3.5 py-2 rounded-xl text-xs font-semibold flex items-center gap-2 border transition shadow-sm ${
+                        selectedProject.status === 'AWAITING_CLARIFICATION'
+                          ? 'bg-violet-600/25 hover:bg-violet-600/35 border-violet-500/40 text-violet-300 shadow-violet-500/10 ring-1 ring-violet-500/30'
+                          : 'bg-slate-800/80 hover:bg-slate-800 border-slate-700/80 text-slate-200'
+                      }`}
+                      title="Open interactive AI interview mode"
+                    >
+                      <Sparkles className="w-3.5 h-3.5 text-cyan-400" />
+                      AI Clarification Chat
+                      {openQuestions.length > 0 && (
+                        <span className="text-[10px] font-bold px-1.5 py-0.5 rounded-full bg-violet-500/30 text-violet-300 border border-violet-500/40">
+                          {openQuestions.length}
+                        </span>
+                      )}
+                    </button>
+                    <button
+                      id="btn-analyze-project"
+                      onClick={handleAnalyze}
+                      disabled={isAnalyzing}
+                      className="px-4 py-2 rounded-xl bg-gradient-to-r from-brand-600 to-indigo-600 hover:from-brand-500 hover:to-indigo-500 text-white text-xs font-semibold shadow-lg shadow-brand-500/20 flex items-center gap-2 transition disabled:opacity-50"
+                    >
+                      {isAnalyzing ? (
+                        <><RefreshCw className="w-3.5 h-3.5 animate-spin" /> Analyzing...</>
+                      ) : (
+                        <><Sparkles className="w-3.5 h-3.5 text-cyan-300" /> Run Analysis</>
+                      )}
+                    </button>
+                  </div>
                 </div>
+
+                {/* Clarification Needed Interactive Banner */}
+                {selectedProject.status === 'AWAITING_CLARIFICATION' && openQuestions.length > 0 && (
+                  <div className="p-3.5 rounded-xl bg-violet-950/40 border border-violet-500/30 flex items-center justify-between gap-3 text-xs text-violet-200">
+                    <div className="flex items-center gap-2.5">
+                      <div className="p-1.5 rounded-lg bg-violet-500/20 text-violet-400 shrink-0">
+                        <MessageCircleQuestion className="w-4 h-4" />
+                      </div>
+                      <div>
+                        <span className="font-semibold text-white">Clarification needed:</span>{' '}
+                        {openQuestions.length} open requirement {openQuestions.length === 1 ? 'gap requires' : 'gaps require'} stakeholder clarification before compiling your BRD.
+                      </div>
+                    </div>
+                    <button
+                      onClick={() => setIsChatOpen(true)}
+                      className="px-3 py-1.5 rounded-lg bg-violet-600 hover:bg-violet-500 text-white text-xs font-semibold shrink-0 shadow-md transition flex items-center gap-1.5"
+                    >
+                      <Sparkles className="w-3.5 h-3.5 text-cyan-300" />
+                      Open AI Interviewer ({openQuestions.length})
+                    </button>
+                  </div>
+                )}
 
                 {/* ─── Workspace Tabs ─── */}
                 <div className="flex items-center gap-1.5 overflow-x-auto pb-0.5">
@@ -785,6 +1048,69 @@ export default function App() {
           </div>
         </div>
       )}
+      {/* ═══════════════════ Floating AI Assistant Button ═══════════════════ */}
+      {selectedProject && !isChatOpen && (
+        <button
+          id="btn-floating-chat"
+          onClick={() => setIsChatOpen(true)}
+          className="fixed bottom-6 right-6 z-30 px-4 py-3 rounded-full bg-gradient-to-r from-brand-600 to-indigo-600 hover:from-brand-500 hover:to-indigo-500 text-white text-xs font-semibold shadow-2xl shadow-brand-500/30 border border-brand-400/30 flex items-center gap-2 transition hover:scale-105 active:scale-95"
+          title="Open interactive AI Interview Assistant"
+        >
+          <Sparkles className="w-4 h-4 text-cyan-300" />
+          <span>Ask AI / Interview Assistant</span>
+          {openQuestions.length > 0 && (
+            <span className="w-5 h-5 rounded-full bg-violet-500 text-white text-[10px] font-bold flex items-center justify-center">
+              {openQuestions.length}
+            </span>
+          )}
+        </button>
+      )}
+
+      {/* ═══════════════════ AI Clarification Drawer ═══════════════════ */}
+      {selectedProject && (
+        <ClarificationChatDrawer
+          isOpen={isChatOpen}
+          onClose={() => setIsChatOpen(false)}
+          project={selectedProject}
+          openQuestions={openQuestions}
+          currentUserProfile={userProfile}
+          onClarificationResolved={() => {
+            loadProjectData(selectedProject.id);
+            fetchProjects();
+          }}
+          onNavigateToGenerate={() => {
+            setActiveTab('brd');
+          }}
+        />
+      )}
+
+      {/* ═══════════════════ User Profile Modal ═══════════════════ */}
+      <UserProfileModal
+        isOpen={isProfileModalOpen}
+        onClose={() => setIsProfileModalOpen(false)}
+        currentProfile={userProfile}
+        currentUserEmail={currentUser?.email}
+        onProfileUpdated={(updated) => {
+          setUserProfile(updated);
+        }}
+      />
+
+      {/* ═══════════════════ Share Project Modal ═══════════════════ */}
+      {selectedProject && (
+        <ShareProjectModal
+          isOpen={isShareModalOpen}
+          onClose={() => setIsShareModalOpen(false)}
+          project={selectedProject}
+          currentUserId={currentUser?.id}
+          onCollaboratorChanged={() => {
+            if (selectedProject) {
+              loadProjectData(selectedProject.id);
+              fetchProjects();
+            }
+          }}
+        />
+      )}
+
     </div>
   );
 }

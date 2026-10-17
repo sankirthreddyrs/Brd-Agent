@@ -38,6 +38,12 @@ class InMemoryProjectRepository:
         self.source_documents: dict[str, SourceDocument] = {}
         self.source_chunks: dict[str, list[SourceChunk]] = {}
         self.brd_versions: dict[str, list[BRDDocumentVersion]] = {}
+        self.profiles: dict[str, dict[str, Any]] = {}
+        self.project_collaborators: dict[str, list[dict[str, Any]]] = {}
+        self.project_chat_messages: dict[str, list[dict[str, Any]]] = {}
+        self.project_invitations: dict[str, dict[str, Any]] = {}
+
+
 
     def create_project(
         self,
@@ -89,13 +95,175 @@ class InMemoryProjectRepository:
             self.projects.values(), key=lambda p: p["created_at"], reverse=True
         )
         if owner_id:
-            sorted_projs = [
-                p for p in sorted_projs
-                if p.get("owner_id") == owner_id or p.get("owner_id") is None
-            ]
+            matching = []
+            for p in sorted_projs:
+                pid = p["id"]
+                collabs = self.project_collaborators.get(pid, [])
+                is_collab = any(c.get("user_id") == owner_id for c in collabs)
+                if p.get("owner_id") == owner_id or is_collab or p.get("owner_id") is None:
+                    p_copy = dict(p)
+                    p_copy["is_owner"] = (p.get("owner_id") == owner_id or p.get("owner_id") is None)
+                    p_copy["collaborator_count"] = len(collabs)
+                    matching.append(p_copy)
+            return [self._to_project(p) for p in matching[:limit]]
         return [self._to_project(p) for p in sorted_projs[:limit]]
 
     get_projects = list_projects
+
+    def get_profile(self, user_id: str) -> Optional[dict[str, Any]]:
+        return self.profiles.get(user_id)
+
+    def upsert_profile(
+        self,
+        user_id: str,
+        email: str,
+        full_name: Optional[str] = None,
+        role_title: Optional[str] = None,
+        avatar_url: Optional[str] = None,
+    ) -> dict[str, Any]:
+        prof = self.profiles.setdefault(
+            user_id,
+            {"id": user_id, "email": email, "created_at": datetime.now(timezone.utc).isoformat()},
+        )
+        prof["email"] = email
+        if full_name is not None:
+            prof["full_name"] = full_name
+        if role_title is not None:
+            prof["role_title"] = role_title
+        if avatar_url is not None:
+            prof["avatar_url"] = avatar_url
+        prof["updated_at"] = datetime.now(timezone.utc).isoformat()
+        return prof
+
+    def add_collaborator(
+        self, project_id: str, user_id: str, user_email: str, role: str = "editor"
+    ) -> dict[str, Any]:
+        collabs = self.project_collaborators.setdefault(project_id, [])
+        for c in collabs:
+            if c.get("user_id") == user_id:
+                return c
+        now = datetime.now(timezone.utc).isoformat()
+        collab = {
+            "id": str(uuid.uuid4()),
+            "project_id": project_id,
+            "user_id": user_id,
+            "user_email": user_email,
+            "role": role,
+            "created_at": now,
+        }
+        collabs.append(collab)
+        return collab
+
+    def get_collaborators(self, project_id: str) -> list[dict[str, Any]]:
+        collabs = [dict(c) for c in self.project_collaborators.get(project_id, [])]
+        for c in collabs:
+            uid = c.get("user_id")
+            if uid and uid in self.profiles:
+                c["full_name"] = self.profiles[uid].get("full_name")
+        return collabs
+
+    def remove_collaborator(self, project_id: str, user_id: str) -> bool:
+        if project_id in self.project_collaborators:
+            self.project_collaborators[project_id] = [
+                c for c in self.project_collaborators[project_id] if c.get("user_id") != user_id
+            ]
+        return True
+
+    def save_chat_message(
+        self,
+        project_id: str,
+        sender_id: Optional[str],
+        sender_email: str,
+        sender_name: Optional[str],
+        role: str,
+        content: str,
+    ) -> dict[str, Any]:
+        msgs = self.project_chat_messages.setdefault(project_id, [])
+        now = datetime.now(timezone.utc).isoformat()
+        row = {
+            "id": str(uuid.uuid4()),
+            "project_id": project_id,
+            "sender_id": sender_id,
+            "sender_email": sender_email,
+            "sender_name": sender_name,
+            "role": role,
+            "content": content,
+            "created_at": now,
+        }
+        msgs.append(row)
+        return row
+
+    def get_chat_history(self, project_id: str) -> list[dict[str, Any]]:
+        return list(self.project_chat_messages.get(project_id, []))
+
+    def create_invitation(
+        self,
+        project_id: str,
+        inviter_id: str,
+        inviter_email: str,
+        invitee_email: str,
+        role: str = "editor",
+    ) -> dict[str, Any]:
+        now = datetime.now(timezone.utc).isoformat()
+        clean_invitee_email = invitee_email.strip().lower()
+        inv_id = str(uuid.uuid4())
+        token = str(uuid.uuid4())
+        project_title = None
+        if project_id in self.projects:
+            project_title = self.projects[project_id].get("title")
+
+        row = {
+            "id": inv_id,
+            "project_id": project_id,
+            "project_title": project_title,
+            "inviter_id": inviter_id,
+            "inviter_email": inviter_email,
+            "invitee_email": clean_invitee_email,
+            "role": role,
+            "status": "pending",
+            "token": token,
+            "created_at": now,
+            "accepted_at": None,
+        }
+        self.project_invitations[inv_id] = row
+        return dict(row)
+
+    def get_pending_invitations_for_email(self, email: str) -> list[dict[str, Any]]:
+        clean_email = email.strip().lower()
+        res = []
+        for inv in self.project_invitations.values():
+            if (
+                inv.get("invitee_email", "").strip().lower() == clean_email
+                and inv.get("status") == "pending"
+            ):
+                item = dict(inv)
+                if not item.get("project_title") and item.get("project_id") in self.projects:
+                    item["project_title"] = self.projects[item["project_id"]].get("title")
+                res.append(item)
+        return sorted(res, key=lambda x: x.get("created_at", ""), reverse=True)
+
+    def accept_invitation(
+        self, invitation_id: str, user_id: str, user_email: str
+    ) -> dict[str, Any]:
+        if invitation_id not in self.project_invitations:
+            raise ValueError(f"Invitation with id '{invitation_id}' not found.")
+        inv = self.project_invitations[invitation_id]
+
+        clean_user_email = user_email.strip().lower()
+        clean_invitee_email = inv.get("invitee_email", "").strip().lower()
+        if clean_user_email != clean_invitee_email:
+            raise ValueError(
+                f"User email '{clean_user_email}' does not match invitation recipient '{clean_invitee_email}'."
+            )
+
+        now = datetime.now(timezone.utc).isoformat()
+        inv["status"] = "accepted"
+        inv["accepted_at"] = now
+
+        # Add user to collaborators
+        self.add_collaborator(inv["project_id"], user_id, user_email, inv.get("role", "editor"))
+        return dict(inv)
+
 
     def update_project(self, project: Project) -> Project:
         if project.id not in self.projects:
@@ -411,6 +579,8 @@ class InMemoryProjectRepository:
             last_error=row.get("last_error"),
             owner_id=row.get("owner_id"),
             owner_email=row.get("owner_email"),
+            collaborator_count=int(row.get("collaborator_count", 0)),
+            is_owner=bool(row.get("is_owner", True)),
         )
 
 

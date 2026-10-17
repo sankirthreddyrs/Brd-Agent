@@ -3,7 +3,7 @@
 from datetime import datetime, timezone
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 import uuid
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile, status
@@ -20,30 +20,119 @@ from app.api.schemas_api import (
     AssumptionDecisionRequest,
     BRDGenerateResponse,
     BRDVersionResponse,
+    ChatHistoryResponse,
+    ChatMessage,
+    ChatMessageRecord,
+    ChatRequest,
+    ChatResponse,
+    CollaboratorResponse,
     CreateProjectRequest,
     CreateProjectResponse,
+    InvitationResponse,
+    InviteCollaboratorRequest,
     ProjectDetailResponse,
     SourceDocumentListResponse,
     SourceDocumentResponse,
     SubmitAnswersRequest,
     SubmitAnswersResponse,
+    UserProfileResponse,
+    UserProfileUpdateRequest,
 )
 from app.core.brd_generator import BRDGenerator
 from app.core.document_parser import DocumentParser
 from app.core.docx_renderer import render_brd_to_docx
+from app.core.merge import merge_answers_into_requirements
 from app.core.orchestrator import BRDOrchestrator
 from app.core.state_machine import InvalidTransitionError
+from app.core.validation_rules import (
+    validate_project_completeness,
+    validate_requirements,
+)
 from app.db.repository import ProjectRepository
 from app.llm.llm_client import LLMClient, GeminiClient
+from app.llm.prompts import (
+    build_clarification_chat_prompt,
+    ChatTurnEvaluation,
+)
 from app.models.answer import Answer
 from app.models.assumption import Assumption, AssumptionStatus
 from app.models.document import SourceChunk, SourceDocument, SourceDocumentStatus
 from app.models.project import Project, ProjectStatus
 from app.models.question import AnswerFormat, Question
+from app.models.requirement import Requirement
+from app.models.validation import ValidationResult
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/projects", tags=["projects"])
+user_router = APIRouter(prefix="/user", tags=["user"])
+invitations_router = APIRouter(prefix="/invitations", tags=["invitations"])
+
+
+
+@user_router.get(
+    "/profile",
+    response_model=UserProfileResponse,
+    summary="Get active user profile",
+)
+@router.get(
+    "/user/profile",
+    response_model=UserProfileResponse,
+    summary="Get active user profile",
+)
+def get_user_profile(
+    current_user: AuthenticatedUser = Depends(get_current_user),
+    repository: ProjectRepository = Depends(get_repository),
+) -> UserProfileResponse:
+    """Retrieve the active authenticated user's profile from the database."""
+    prof = repository.get_profile(current_user.user_id) if hasattr(repository, "get_profile") else None
+    if not prof:
+        return UserProfileResponse(
+            id=current_user.user_id,
+            email=current_user.email,
+            full_name=None,
+            role_title=None,
+            avatar_url=None,
+        )
+    return UserProfileResponse(
+        id=prof["id"],
+        email=prof.get("email") or current_user.email,
+        full_name=prof.get("full_name"),
+        role_title=prof.get("role_title"),
+        avatar_url=prof.get("avatar_url"),
+    )
+
+
+@user_router.put(
+    "/profile",
+    response_model=UserProfileResponse,
+    summary="Update active user profile",
+)
+@router.put(
+    "/user/profile",
+    response_model=UserProfileResponse,
+    summary="Update active user profile",
+)
+def update_user_profile(
+    request: UserProfileUpdateRequest,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+    repository: ProjectRepository = Depends(get_repository),
+) -> UserProfileResponse:
+    """Update full_name, role_title, and avatar_url in user's profile."""
+    prof = repository.upsert_profile(
+        user_id=current_user.user_id,
+        email=current_user.email,
+        full_name=request.full_name,
+        role_title=request.role_title,
+        avatar_url=request.avatar_url,
+    )
+    return UserProfileResponse(
+        id=prof["id"],
+        email=prof.get("email") or current_user.email,
+        full_name=prof.get("full_name"),
+        role_title=prof.get("role_title"),
+        avatar_url=prof.get("avatar_url"),
+    )
 
 
 @router.post(
@@ -103,24 +192,124 @@ def list_projects(
 def get_project_detail(
     project_id: str,
     repository: ProjectRepository = Depends(get_repository),
+    current_user: AuthenticatedUser = Depends(get_current_user),
 ) -> ProjectDetailResponse:
-    """Fetch project details accompanied by counts of requirements, open questions, and assumptions."""
+    """Fetch project details accompanied by counts of requirements, open questions, assumptions, and collaborators."""
     try:
         project = repository.get_project(project_id)
         requirements = repository.get_requirements(project_id)
         open_questions = repository.get_open_questions(project_id)
         assumptions = repository.get_assumptions(project_id)
+        collabs = repository.get_collaborators(project_id) if hasattr(repository, "get_collaborators") else []
+
+        is_owner = (project.owner_id == current_user.user_id) if current_user and project.owner_id else True
+        collab_count = len(collabs)
+        updated_project = project.model_copy(update={"is_owner": is_owner, "collaborator_count": collab_count})
 
         return ProjectDetailResponse(
-            project=project,
+            project=updated_project,
             requirement_count=len(requirements),
             open_question_count=len(open_questions),
             assumption_count=len(assumptions),
+            collaborator_count=collab_count,
+            is_owner=is_owner,
         )
     except ValueError as err:
         if "not found" in str(err).lower():
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(err))
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(err))
+
+
+@router.post(
+    "/{project_id}/join",
+    response_model=Project,
+    summary="Join project via share link",
+)
+def join_project(
+    project_id: str,
+    repository: ProjectRepository = Depends(get_repository),
+    current_user: AuthenticatedUser = Depends(get_current_user),
+) -> Project:
+    """Enrolls current authenticated user into project_collaborators and returns the updated project."""
+    try:
+        project = repository.get_project(project_id)
+    except ValueError as err:
+        if "not found" in str(err).lower():
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(err))
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(err))
+
+    # Add as collaborator with 'editor' role if not already owner
+    if project.owner_id != current_user.user_id:
+        repository.add_collaborator(
+            project_id=project_id,
+            user_id=current_user.user_id,
+            user_email=current_user.email,
+            role="editor",
+        )
+
+    collabs = repository.get_collaborators(project_id) if hasattr(repository, "get_collaborators") else []
+    is_owner = (project.owner_id == current_user.user_id)
+    return project.model_copy(update={"is_owner": is_owner, "collaborator_count": len(collabs)})
+
+
+@router.get(
+    "/{project_id}/collaborators",
+    response_model=list[CollaboratorResponse],
+    summary="Get project team collaborators",
+)
+def get_collaborators(
+    project_id: str,
+    repository: ProjectRepository = Depends(get_repository),
+) -> list[CollaboratorResponse]:
+    """Retrieve all collaborators enrolled in a project."""
+    try:
+        repository.get_project(project_id)
+        collabs = repository.get_collaborators(project_id) if hasattr(repository, "get_collaborators") else []
+        return [
+            CollaboratorResponse(
+                id=c["id"],
+                project_id=c["project_id"],
+                user_id=c["user_id"],
+                user_email=c["user_email"],
+                full_name=c.get("full_name"),
+                role=c.get("role", "editor"),
+                created_at=c.get("created_at"),
+            )
+            for c in collabs
+        ]
+    except ValueError as err:
+        if "not found" in str(err).lower():
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(err))
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(err))
+
+
+@router.delete(
+    "/{project_id}/collaborators/{collaborator_user_id}",
+    summary="Remove a collaborator from project",
+)
+def remove_collaborator(
+    project_id: str,
+    collaborator_user_id: str,
+    repository: ProjectRepository = Depends(get_repository),
+    current_user: AuthenticatedUser = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Allows project owner to remove a collaborator."""
+    try:
+        project = repository.get_project(project_id)
+    except ValueError as err:
+        if "not found" in str(err).lower():
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(err))
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(err))
+
+    # Owner-only check
+    if project.owner_id and project.owner_id != current_user.user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the project owner can remove collaborators.",
+        )
+
+    repository.remove_collaborator(project_id, collaborator_user_id)
+    return {"status": "removed", "user_id": collaborator_user_id}
 
 
 @router.post(
@@ -440,6 +629,25 @@ def analyze_project(
 
 
 @router.get(
+    "/{project_id}/requirements",
+    response_model=list[Requirement],
+    summary="Get all project requirements",
+)
+def get_requirements(
+    project_id: str,
+    repository: ProjectRepository = Depends(get_repository),
+) -> list[Requirement]:
+    """Retrieve all requirements currently captured for the project."""
+    try:
+        repository.get_project(project_id)
+        return repository.get_requirements(project_id)
+    except ValueError as err:
+        if "not found" in str(err).lower():
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(err))
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(err))
+
+
+@router.get(
     "/{project_id}/questions",
     response_model=list[Question],
     summary="Get open clarification questions",
@@ -573,6 +781,367 @@ def submit_answers(
                 detail=f"Gemini API failure during re-analysis: {err_msg}",
             )
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=err_msg)
+
+
+@router.post(
+    "/{project_id}/chat",
+    response_model=ChatResponse,
+    summary="Interactive conversational clarification interview",
+)
+def clarification_chat(
+    project_id: str,
+    request: ChatRequest,
+    repository: ProjectRepository = Depends(get_repository),
+    gemini_client: LLMClient = Depends(get_gemini_client),
+    current_user: AuthenticatedUser = Depends(get_current_user),
+) -> ChatResponse:
+    """Conversational interview mode with a Senior Business Analyst / Requirements Engineer.
+
+    Provides the assistant with full project context (idea, requirements, open questions, source chunks).
+    If the user's message provides the answer to an open question:
+      - Automatically saves an Answer stamped with the current user's ID and email.
+      - Merges the answer into requirements and updates trace_refs.
+      - Re-run validation rules. If zero blockers remain, transitions project status to READY_TO_GENERATE.
+    Otherwise, answers conversationally and prompts for the next prioritized clarification gap.
+    """
+    try:
+        project = repository.get_project(project_id)
+    except ValueError as err:
+        if "not found" in str(err).lower():
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(err))
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(err))
+
+    if not project:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Project with id '{project_id}' not found.",
+        )
+
+    try:
+        # 1. Load full project context
+        requirements = repository.get_requirements(project_id)
+        open_questions = repository.get_open_questions(project_id)
+        chunks = repository.get_source_chunks_by_project(project_id)
+
+        # 2. Format sender identity for collaborative interview grounding
+        sender_prof = repository.get_profile(current_user.user_id) if hasattr(repository, "get_profile") else None
+        sender_name = (sender_prof.get("full_name") if sender_prof else None) or current_user.email or "Stakeholder"
+        role_title = (sender_prof.get("role_title") if sender_prof else None) or "Team Member"
+        sender_prefixed_message = f"[Sender: {sender_name} ({role_title})]: {request.message}"
+
+        # 3. Build prompt and evaluate chat turn with LLM
+        prompt = build_clarification_chat_prompt(
+            project=project,
+            requirements=requirements,
+            open_questions=open_questions,
+            history=request.history,
+            new_message=sender_prefixed_message,
+            chunks=chunks,
+        )
+
+        try:
+            chat_eval = gemini_client.generate_structured(prompt, ChatTurnEvaluation)
+        except Exception as err:
+            logger.error("Failed to generate chat evaluation from LLM: %s", err)
+            chat_eval = ChatTurnEvaluation(
+                answered_question_id=None,
+                extracted_answer=None,
+                reply="I'm having trouble processing your response right now. Could you please clarify your answer?",
+            )
+
+        answered_qid = chat_eval.answered_question_id
+        extracted_val = chat_eval.extracted_answer or request.message
+
+        target_question = next((q for q in open_questions if q.id == answered_qid), None) if answered_qid else None
+
+        # 3. If an open question was answered, save answer, merge requirements, and re-validate
+        if target_question and extracted_val:
+            now = datetime.now(timezone.utc)
+            answer = Answer(
+                id=f"ANS:{uuid.uuid4().hex[:6].upper()}",
+                project_id=project_id,
+                question_id=target_question.id,
+                value=extracted_val,
+                answered_at=now,
+                answered_by=current_user.user_id,
+                answerer_email=current_user.email,
+            )
+            repository.save_answer(project_id, answer)
+
+            all_questions = repository.get_all_questions(project_id)
+            all_answers = repository.get_answers(project_id)
+            merged_reqs = merge_answers_into_requirements(
+                requirements=requirements,
+                questions=all_questions,
+                answers=all_answers,
+            )
+            repository.save_requirements(project_id, merged_reqs)
+
+            # Re-run validation rules
+            req_val = validate_requirements(merged_reqs)
+            comp_val = validate_project_completeness(merged_reqs)
+            combined_issues = req_val.issues + comp_val.issues
+            val_result = ValidationResult(issues=combined_issues)
+            repository.save_validation_issues(project_id, val_result)
+
+            refreshed_open_questions = repository.get_open_questions(project_id)
+            has_zero_blockers = (not val_result.has_blockers) and (len(refreshed_open_questions) == 0)
+
+            if has_zero_blockers:
+                try:
+                    if project.status == ProjectStatus.AWAITING_CLARIFICATION:
+                        project = repository.set_status_with_transition(
+                            project_id=project_id,
+                            new_status=ProjectStatus.ANALYZING,
+                            event="answers_submitted",
+                        )
+                        project = repository.set_status_with_transition(
+                            project_id=project_id,
+                            new_status=ProjectStatus.READY_TO_GENERATE,
+                            event="no_blocking_gaps",
+                        )
+                    elif project.status == ProjectStatus.ANALYZING:
+                        project = repository.set_status_with_transition(
+                            project_id=project_id,
+                            new_status=ProjectStatus.READY_TO_GENERATE,
+                            event="no_blocking_gaps",
+                        )
+                    elif project.status == ProjectStatus.DRAFT:
+                        project = repository.set_status_with_transition(
+                            project_id=project_id,
+                            new_status=ProjectStatus.ANALYZING,
+                            event="analyze",
+                        )
+                        project = repository.set_status_with_transition(
+                            project_id=project_id,
+                            new_status=ProjectStatus.READY_TO_GENERATE,
+                            event="no_blocking_gaps",
+                        )
+                except Exception as exc:
+                    logger.warning("Could not transition project status: %s", exc)
+        else:
+            answered_qid = None
+
+        final_open_questions = repository.get_open_questions(project_id)
+        current_status_val = project.status.value if hasattr(project.status, "value") else str(project.status)
+
+        # Persist conversation turn in database
+        if hasattr(repository, "save_chat_message"):
+            sender_full_name = (sender_prof.get("full_name") if sender_prof else None) or sender_name
+            repository.save_chat_message(
+                project_id=project_id,
+                sender_id=current_user.user_id,
+                sender_email=current_user.email,
+                sender_name=sender_full_name,
+                role="user",
+                content=request.message,
+            )
+            repository.save_chat_message(
+                project_id=project_id,
+                sender_id=None,
+                sender_email="ai@brdagent.local",
+                sender_name="BRD Assistant",
+                role="assistant",
+                content=chat_eval.reply,
+            )
+
+        return ChatResponse(
+            reply=chat_eval.reply,
+            answered_question_id=answered_qid,
+            project_status=current_status_val,
+            open_question_count=len(final_open_questions),
+            is_ready_to_generate=(project.status == ProjectStatus.READY_TO_GENERATE),
+        )
+
+    except HTTPException:
+        raise
+    except Exception as err:
+        logger.error("Error during clarification chat: %s", err)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Clarification chat error: {err}",
+        )
+
+
+@router.get(
+    "/{project_id}/chat/history",
+    response_model=ChatHistoryResponse,
+    summary="Get chronological chat history for project",
+)
+def get_project_chat_history(
+    project_id: str,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+    repository: ProjectRepository = Depends(get_repository),
+) -> ChatHistoryResponse:
+    """Retrieve full chronological chat history for a project."""
+    project = repository.get_project(project_id)
+    if not project:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Project with id '{project_id}' not found.",
+        )
+    raw_msgs = (
+        repository.get_chat_history(project_id)
+        if hasattr(repository, "get_chat_history")
+        else []
+    )
+    records = [
+        ChatMessageRecord(
+            id=str(m.get("id")),
+            project_id=str(m.get("project_id")),
+            sender_id=m.get("sender_id"),
+            sender_email=m.get("sender_email") or "",
+            sender_name=m.get("sender_name"),
+            role=m.get("role") or "user",
+            content=m.get("content") or "",
+            created_at=m.get("created_at") or "",
+        )
+        for m in raw_msgs
+    ]
+    return ChatHistoryResponse(messages=records)
+
+
+# ----------------------------------------------------------------------
+# Project Invitations Routes
+# ----------------------------------------------------------------------
+
+
+@router.post(
+    "/{project_id}/invitations",
+    response_model=InvitationResponse,
+    summary="Invite a team collaborator via email",
+)
+def invite_collaborator(
+    project_id: str,
+    request: InviteCollaboratorRequest,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+    repository: ProjectRepository = Depends(get_repository),
+) -> InvitationResponse:
+    """Send an email invitation to collaborate on a project (owner-only)."""
+    project = repository.get_project(project_id)
+    if not project:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Project with id '{project_id}' not found.",
+        )
+
+    # Guard: Only project owner can invite
+    if project.owner_id and str(project.owner_id) != str(current_user.user_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the project owner can invite collaborators.",
+        )
+
+    clean_email = request.email.strip().lower()
+    if not clean_email or "@" not in clean_email:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid email address provided for invitation.",
+        )
+
+    inv = repository.create_invitation(
+        project_id=project_id,
+        inviter_id=current_user.user_id,
+        inviter_email=current_user.email,
+        invitee_email=clean_email,
+        role=request.role or "editor",
+    )
+    return InvitationResponse(
+        id=str(inv.get("id")),
+        project_id=str(inv.get("project_id")),
+        project_title=inv.get("project_title") or project.title,
+        inviter_email=inv.get("inviter_email") or current_user.email,
+        invitee_email=inv.get("invitee_email") or clean_email,
+        role=inv.get("role") or "editor",
+        status=inv.get("status") or "pending",
+        created_at=inv.get("created_at") or datetime.now(timezone.utc).isoformat(),
+    )
+
+
+@user_router.get(
+    "/invitations",
+    response_model=list[InvitationResponse],
+    summary="Get pending project invitations for active user",
+)
+@router.get(
+    "/user/invitations",
+    response_model=list[InvitationResponse],
+    summary="Get pending project invitations for active user",
+)
+def get_user_invitations(
+    current_user: AuthenticatedUser = Depends(get_current_user),
+    repository: ProjectRepository = Depends(get_repository),
+) -> list[InvitationResponse]:
+    """Retrieve all pending project invitations addressed to the active user's email."""
+    raw_invs = (
+        repository.get_pending_invitations_for_email(current_user.email)
+        if hasattr(repository, "get_pending_invitations_for_email")
+        else []
+    )
+    return [
+        InvitationResponse(
+            id=str(inv.get("id")),
+            project_id=str(inv.get("project_id")),
+            project_title=inv.get("project_title"),
+            inviter_email=inv.get("inviter_email") or "",
+            invitee_email=inv.get("invitee_email") or current_user.email,
+            role=inv.get("role") or "editor",
+            status=inv.get("status") or "pending",
+            created_at=inv.get("created_at") or "",
+        )
+        for inv in raw_invs
+    ]
+
+
+@invitations_router.post(
+    "/{invitation_id}/accept",
+    response_model=Project,
+    summary="Accept a project invitation",
+)
+@router.post(
+    "/invitations/{invitation_id}/accept",
+    response_model=Project,
+    summary="Accept a project invitation",
+)
+def accept_project_invitation(
+    invitation_id: str,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+    repository: ProjectRepository = Depends(get_repository),
+) -> Project:
+    """Accept an email invitation and add the active user as an editor collaborator."""
+    try:
+        inv = repository.accept_invitation(
+            invitation_id=invitation_id,
+            user_id=current_user.user_id,
+            user_email=current_user.email,
+        )
+    except ValueError as exc:
+        err_msg = str(exc)
+        if "not found" in err_msg.lower():
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=err_msg)
+        if "not match" in err_msg.lower() or "not authorized" in err_msg.lower():
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=err_msg)
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=err_msg)
+
+    project_id = inv.get("project_id")
+    project = repository.get_project(project_id)
+    if not project:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Project with id '{project_id}' not found.",
+        )
+
+    # Calculate collaborators and ownership
+    collabs = (
+        repository.get_collaborators(project_id)
+        if hasattr(repository, "get_collaborators")
+        else []
+    )
+    is_owner = (project.owner_id is not None) and (
+        str(project.owner_id) == str(current_user.user_id)
+    )
+    return project.model_copy(update={"is_owner": is_owner, "collaborator_count": len(collabs)})
+
 
 
 @router.get(

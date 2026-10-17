@@ -5,15 +5,39 @@ import type {
   Assumption,
   BRDGenerateResponse,
   BRDVersion,
+  ChatHistoryResponse,
+  ChatMessage,
+  ChatMessageRecord,
+  ChatRequest,
+  ChatResponse,
+  CollaboratorResponse,
   CreateProjectResponse,
   HealthResponse,
+  InvitationResponse,
   Project,
   ProjectDetailResponse,
   Question,
+  Requirement,
   SourceDocument,
   SourceDocumentListResponse,
   SubmitAnswersResponse,
+  UserProfileResponse,
+  UserProfileUpdateRequest,
 } from '../types';
+
+export type {
+  ChatHistoryResponse,
+  ChatMessage,
+  ChatMessageRecord,
+  ChatRequest,
+  ChatResponse,
+  CollaboratorResponse,
+  InvitationResponse,
+  UserProfileResponse,
+  UserProfileUpdateRequest,
+};
+
+
 
 /**
  * Check backend API operational health.
@@ -192,3 +216,115 @@ export async function retryProject(projectId: string): Promise<Project> {
   const response = await apiClient.post<Project>(`/projects/${projectId}/retry`);
   return response.data;
 }
+
+/**
+ * Retrieve all requirements captured for a project.
+ */
+export async function getRequirements(projectId: string): Promise<Requirement[]> {
+  const response = await apiClient.get<Requirement[]>(`/projects/${projectId}/requirements`);
+  return response.data;
+}
+
+/**
+ * Send a conversational clarification message to the AI interviewer.
+ */
+export async function sendProjectChatMessage(
+  projectId: string,
+  message: string,
+  history: ChatMessage[] = []
+): Promise<ChatResponse> {
+  const response = await apiClient.post<ChatResponse>(`/projects/${projectId}/chat`, {
+    message,
+    history,
+  });
+  return response.data;
+}
+
+/**
+ * Fetch authenticated user profile metadata.
+ */
+export async function getUserProfile(): Promise<UserProfileResponse> {
+  const response = await apiClient.get<UserProfileResponse>('/user/profile');
+  return response.data;
+}
+
+/**
+ * Update authenticated user profile (full name, role title, avatar).
+ */
+export async function updateUserProfile(
+  data: UserProfileUpdateRequest
+): Promise<UserProfileResponse> {
+  const response = await apiClient.put<UserProfileResponse>('/user/profile', data);
+  return response.data;
+}
+
+/**
+ * List all team members collaborating on a project.
+ */
+export async function getCollaborators(projectId: string): Promise<CollaboratorResponse[]> {
+  const response = await apiClient.get<CollaboratorResponse[]>(
+    `/projects/${projectId}/collaborators`
+  );
+  return response.data;
+}
+
+/**
+ * Enroll active authenticated user as a collaborator via share link.
+ */
+export async function joinProject(projectId: string): Promise<Project> {
+  const response = await apiClient.post<Project>(`/projects/${projectId}/join`);
+  return response.data;
+}
+
+/**
+ * Remove a collaborator from a project (owner-only permission).
+ */
+export async function removeCollaborator(
+  projectId: string,
+  userId: string
+): Promise<void> {
+  await apiClient.delete(`/projects/${projectId}/collaborators/${userId}`);
+}
+
+/**
+ * Retrieve persistent chronological chat history for a project.
+ */
+export async function getChatHistory(projectId: string): Promise<ChatMessageRecord[]> {
+  const response = await apiClient.get<ChatHistoryResponse>(
+    `/projects/${projectId}/chat/history`
+  );
+  return response.data.messages || [];
+}
+
+/**
+ * Send an email invitation to collaborate on a project.
+ */
+export async function sendProjectInvitation(
+  projectId: string,
+  email: string,
+  role: string = 'editor'
+): Promise<InvitationResponse> {
+  const response = await apiClient.post<InvitationResponse>(
+    `/projects/${projectId}/invitations`,
+    { email, role }
+  );
+  return response.data;
+}
+
+/**
+ * Fetch pending project invitations addressed to the active user's email.
+ */
+export async function getUserInvitations(): Promise<InvitationResponse[]> {
+  const response = await apiClient.get<InvitationResponse[]>('/user/invitations');
+  return response.data || [];
+}
+
+/**
+ * Accept a project invitation and enroll as collaborator.
+ */
+export async function acceptInvitation(invitationId: string): Promise<Project> {
+  const response = await apiClient.post<Project>(`/invitations/${invitationId}/accept`);
+  return response.data;
+}
+
+

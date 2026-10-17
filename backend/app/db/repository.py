@@ -131,32 +131,376 @@ class ProjectRepository:
     def list_projects(
         self, limit: int = 20, owner_id: Optional[str] = None
     ) -> list[Project]:
-        """List recently updated projects, optionally filtered by owner_id.
+        """List recently updated projects, filtered by ownership or collaboration.
 
         Args:
             limit: Maximum count to return.
-            owner_id: Optional user UUID to filter projects by owner.
+            owner_id: Optional user UUID to filter projects by owner or collaboration.
 
         Returns:
-            List of Project models.
+            List of Project models with collaborator_count and is_owner flags.
         """
         try:
-            query = self.client.table("projects").select("*")
             if owner_id:
-                query = query.eq("owner_id", owner_id)
-            res = (
-                query
-                .order("created_at", desc=True)
-                .limit(limit)
-                .execute()
-            )
-            return [self._row_to_project(r) for r in (res.data or [])]
+                # 1. Projects owned by user
+                owned_res = (
+                    self.client.table("projects")
+                    .select("*")
+                    .eq("owner_id", owner_id)
+                    .execute()
+                )
+                owned_rows = owned_res.data or []
+
+                # 2. Projects where user is enrolled as collaborator
+                collab_res = (
+                    self.client.table("project_collaborators")
+                    .select("project_id")
+                    .eq("user_id", owner_id)
+                    .execute()
+                )
+                collab_pids = [
+                    c["project_id"] for c in (collab_res.data or []) if c.get("project_id")
+                ]
+
+                collab_rows = []
+                if collab_pids:
+                    c_res = (
+                        self.client.table("projects")
+                        .select("*")
+                        .in_("id", collab_pids)
+                        .execute()
+                    )
+                    collab_rows = c_res.data or []
+
+                combined: dict[str, dict[str, Any]] = {}
+                for r in owned_rows + collab_rows:
+                    combined[str(r["id"])] = r
+
+                rows = sorted(
+                    combined.values(),
+                    key=lambda r: str(r.get("created_at", "")),
+                    reverse=True,
+                )[:limit]
+            else:
+                res = (
+                    self.client.table("projects")
+                    .select("*")
+                    .order("created_at", desc=True)
+                    .limit(limit)
+                    .execute()
+                )
+                rows = res.data or []
+
+            projects = []
+            for r in rows:
+                p = self._row_to_project(r)
+                is_owner = (p.owner_id == owner_id) if owner_id else True
+                try:
+                    c_cnt_res = (
+                        self.client.table("project_collaborators")
+                        .select("id", count="exact")
+                        .eq("project_id", p.id)
+                        .execute()
+                    )
+                    c_count = c_cnt_res.count or len(c_cnt_res.data or [])
+                except Exception:
+                    c_count = 0
+                projects.append(
+                    p.model_copy(update={"is_owner": is_owner, "collaborator_count": c_count})
+                )
+            return projects
         except Exception as exc:
             logger.error("Error listing projects: %s", exc)
             raise ValueError(f"Failed to list projects: {exc}") from exc
 
     # Alias for naming consistency across callers
     get_projects = list_projects
+
+    # ------------------------------------------------------------------
+    # User Profile & Project Collaboration
+    # ------------------------------------------------------------------
+
+    def get_profile(self, user_id: str) -> Optional[dict[str, Any]]:
+        """Retrieve user profile by auth user ID."""
+        try:
+            res = self.client.table("profiles").select("*").eq("id", user_id).execute()
+            if res.data and len(res.data) > 0:
+                return res.data[0]
+            return None
+        except Exception as exc:
+            logger.error("Failed to get profile for user '%s': %s", user_id, exc)
+            return None
+
+    def upsert_profile(
+        self,
+        user_id: str,
+        email: str,
+        full_name: Optional[str] = None,
+        role_title: Optional[str] = None,
+        avatar_url: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Insert or update user profile."""
+        now = datetime.now(timezone.utc).isoformat()
+        row: dict[str, Any] = {
+            "id": user_id,
+            "email": email,
+            "updated_at": now,
+        }
+        if full_name is not None:
+            row["full_name"] = full_name
+        if role_title is not None:
+            row["role_title"] = role_title
+        if avatar_url is not None:
+            row["avatar_url"] = avatar_url
+
+        try:
+            res = self.client.table("profiles").upsert(row).execute()
+            if res.data and len(res.data) > 0:
+                return res.data[0]
+            return row
+        except Exception as exc:
+            logger.error("Failed to upsert profile for user '%s': %s", user_id, exc)
+            raise ValueError(f"Failed to upsert profile: {exc}") from exc
+
+    def add_collaborator(
+        self, project_id: str, user_id: str, user_email: str, role: str = "editor"
+    ) -> dict[str, Any]:
+        """Add user as collaborator to project if not already enrolled."""
+        try:
+            existing = (
+                self.client.table("project_collaborators")
+                .select("*")
+                .eq("project_id", project_id)
+                .eq("user_id", user_id)
+                .execute()
+            )
+            if existing.data and len(existing.data) > 0:
+                return existing.data[0]
+
+            now = datetime.now(timezone.utc).isoformat()
+            row = {
+                "id": str(uuid.uuid4()),
+                "project_id": project_id,
+                "user_id": user_id,
+                "user_email": user_email,
+                "role": role,
+                "created_at": now,
+            }
+            res = self.client.table("project_collaborators").insert(row).execute()
+            return res.data[0] if res.data else row
+        except Exception as exc:
+            logger.error("Failed to add collaborator to project '%s': %s", project_id, exc)
+            raise ValueError(f"Failed to add collaborator: {exc}") from exc
+
+    def get_collaborators(self, project_id: str) -> list[dict[str, Any]]:
+        """Retrieve all collaborators enrolled in a project with profile details if available."""
+        try:
+            res = (
+                self.client.table("project_collaborators")
+                .select("*")
+                .eq("project_id", project_id)
+                .order("created_at", desc=False)
+                .execute()
+            )
+            collaborators = res.data or []
+            for c in collaborators:
+                uid = c.get("user_id")
+                if uid:
+                    prof = self.get_profile(uid)
+                    if prof:
+                        c["full_name"] = prof.get("full_name")
+            return collaborators
+        except Exception as exc:
+            logger.error("Failed to get collaborators for project '%s': %s", project_id, exc)
+            raise ValueError(f"Failed to get collaborators: {exc}") from exc
+
+    def remove_collaborator(self, project_id: str, user_id: str) -> bool:
+        """Remove a collaborator from a project."""
+        try:
+            self.client.table("project_collaborators").delete().eq(
+                "project_id", project_id
+            ).eq("user_id", user_id).execute()
+            return True
+        except Exception as exc:
+            logger.error(
+                "Failed to remove collaborator '%s' from '%s': %s", user_id, project_id, exc
+            )
+            raise ValueError(f"Failed to remove collaborator: {exc}") from exc
+
+    # ------------------------------------------------------------------
+    # Multi-User Chat Persistence
+    # ------------------------------------------------------------------
+
+    def save_chat_message(
+        self,
+        project_id: str,
+        sender_id: Optional[str],
+        sender_email: str,
+        sender_name: Optional[str],
+        role: str,
+        content: str,
+    ) -> dict[str, Any]:
+        """Persist a chat message to project_chat_messages table."""
+        now = datetime.now(timezone.utc).isoformat()
+        row = {
+            "id": str(uuid.uuid4()),
+            "project_id": project_id,
+            "sender_id": sender_id,
+            "sender_email": sender_email,
+            "sender_name": sender_name,
+            "role": role,
+            "content": content,
+            "created_at": now,
+        }
+        try:
+            res = self.client.table("project_chat_messages").insert(row).execute()
+            return res.data[0] if (res.data and len(res.data) > 0) else row
+        except Exception as exc:
+            logger.error("Failed to save chat message for project '%s': %s", project_id, exc)
+            raise ValueError(f"Failed to save chat message: {exc}") from exc
+
+    def get_chat_history(self, project_id: str) -> list[dict[str, Any]]:
+        """Retrieve all chat messages for a project ordered chronologically."""
+        try:
+            res = (
+                self.client.table("project_chat_messages")
+                .select("*")
+                .eq("project_id", project_id)
+                .order("created_at", desc=False)
+                .execute()
+            )
+            return res.data or []
+        except Exception as exc:
+            logger.error("Failed to get chat history for project '%s': %s", project_id, exc)
+            raise ValueError(f"Failed to get chat history: {exc}") from exc
+
+    # ------------------------------------------------------------------
+    # Project Email Invitations
+    # ------------------------------------------------------------------
+
+    def create_invitation(
+        self,
+        project_id: str,
+        inviter_id: str,
+        inviter_email: str,
+        invitee_email: str,
+        role: str = "editor",
+    ) -> dict[str, Any]:
+        """Create and store a project invitation."""
+        now = datetime.now(timezone.utc).isoformat()
+        clean_invitee_email = invitee_email.strip().lower()
+        token = str(uuid.uuid4())
+
+        # Check project title if available
+        project_title = None
+        try:
+            p_res = self.client.table("projects").select("title").eq("id", project_id).execute()
+            if p_res.data and len(p_res.data) > 0:
+                project_title = p_res.data[0].get("title")
+        except Exception:
+            pass
+
+        row = {
+            "id": str(uuid.uuid4()),
+            "project_id": project_id,
+            "inviter_id": inviter_id,
+            "inviter_email": inviter_email,
+            "invitee_email": clean_invitee_email,
+            "role": role,
+            "status": "pending",
+            "token": token,
+            "created_at": now,
+            "accepted_at": None,
+        }
+        try:
+            res = self.client.table("project_invitations").insert(row).execute()
+            saved = res.data[0] if (res.data and len(res.data) > 0) else row
+            if project_title and "project_title" not in saved:
+                saved["project_title"] = project_title
+            return saved
+        except Exception as exc:
+            logger.error(
+                "Failed to create invitation for '%s' to project '%s': %s",
+                clean_invitee_email,
+                project_id,
+                exc,
+            )
+            raise ValueError(f"Failed to create invitation: {exc}") from exc
+
+    def get_pending_invitations_for_email(self, email: str) -> list[dict[str, Any]]:
+        """Retrieve all pending invitations for a given invitee email."""
+        clean_email = email.strip().lower()
+        try:
+            res = (
+                self.client.table("project_invitations")
+                .select("*")
+                .ilike("invitee_email", clean_email)
+                .eq("status", "pending")
+                .order("created_at", desc=True)
+                .execute()
+            )
+            invites = res.data or []
+            for inv in invites:
+                if not inv.get("project_title"):
+                    pid = inv.get("project_id")
+                    if pid:
+                        try:
+                            p_res = (
+                                self.client.table("projects").select("title").eq("id", pid).execute()
+                            )
+                            if p_res.data and len(p_res.data) > 0:
+                                inv["project_title"] = p_res.data[0].get("title")
+                        except Exception:
+                            pass
+            return invites
+        except Exception as exc:
+            logger.error("Failed to get pending invitations for '%s': %s", clean_email, exc)
+            raise ValueError(f"Failed to get invitations: {exc}") from exc
+
+    def accept_invitation(
+        self, invitation_id: str, user_id: str, user_email: str
+    ) -> dict[str, Any]:
+        """Accept an invitation, enroll user as collaborator, and update status."""
+        try:
+            res = (
+                self.client.table("project_invitations")
+                .select("*")
+                .eq("id", invitation_id)
+                .execute()
+            )
+            if not res.data or len(res.data) == 0:
+                raise ValueError(f"Invitation with id '{invitation_id}' not found.")
+            invitation = res.data[0]
+
+            clean_user_email = user_email.strip().lower()
+            clean_invitee_email = invitation.get("invitee_email", "").strip().lower()
+            if clean_user_email != clean_invitee_email:
+                raise ValueError(
+                    f"User email '{clean_user_email}' does not match invitation recipient '{clean_invitee_email}'."
+                )
+
+            now = datetime.now(timezone.utc).isoformat()
+            upd = (
+                self.client.table("project_invitations")
+                .update({"status": "accepted", "accepted_at": now})
+                .eq("id", invitation_id)
+                .execute()
+            )
+            updated_inv = upd.data[0] if (upd.data and len(upd.data) > 0) else invitation
+            updated_inv["status"] = "accepted"
+            updated_inv["accepted_at"] = now
+
+            # Enroll user into project_collaborators
+            project_id = invitation["project_id"]
+            role = invitation.get("role", "editor")
+            self.add_collaborator(project_id, user_id, user_email, role)
+
+            return updated_inv
+        except Exception as exc:
+            logger.error("Failed to accept invitation '%s': %s", invitation_id, exc)
+            raise ValueError(f"Failed to accept invitation: {exc}") from exc
+
+
 
     def update_project(self, project: Project) -> Project:
         """Update mutable fields of a project.

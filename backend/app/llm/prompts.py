@@ -4,9 +4,11 @@ All prompt templates are implemented as pure, deterministic string generator fun
 """
 
 import json
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
+from pydantic import BaseModel, Field
 
 from app.models.document import SourceChunk
+from app.models.question import Question
 from app.models.requirement import Requirement
 from app.models.validation import ValidationIssue
 
@@ -197,4 +199,124 @@ Requirements for your output:
 4. 'options': If 'answer_format' is 'CHOICE', provide a helpful list of 2 to 5 realistic options. Otherwise, set to null.
 
 Output strictly according to the QuestionDraft schema.
+"""
+
+
+class ChatTurnEvaluation(BaseModel):
+    """Structured response from the LLM evaluating a conversational chat turn."""
+
+    answered_question_id: Optional[str] = Field(
+        default=None,
+        description="The exact ID of the open question that the user's message answered, or null if no question was answered",
+    )
+    extracted_answer: Optional[str] = Field(
+        default=None,
+        description="The clean, specific answer extracted from the user's message, or null if no question was answered",
+    )
+    reply: str = Field(
+        ...,
+        description="Natural, conversational response to the user. Acknowledge any answer provided, answer user queries, and ask the next highest priority clarification question if any remain.",
+    )
+
+
+def build_clarification_chat_prompt(
+    project: Any,
+    requirements: Sequence[Requirement],
+    open_questions: Sequence[Question],
+    history: Sequence[Any],
+    new_message: str,
+    chunks: Optional[Sequence[SourceChunk]] = None,
+) -> str:
+    """Build the prompt instructing the LLM to converse as an expert Requirements Engineer.
+
+    Evaluates user messages against open clarification questions and conducts a natural,
+    step-by-step stakeholder interview.
+    """
+    proj_title = getattr(project, "title", "Untitled Project")
+    proj_idea = getattr(project, "idea", "No idea summary provided")
+    proj_status = getattr(project, "status", "DRAFT")
+    if hasattr(proj_status, "value"):
+        proj_status = proj_status.value
+
+    # Format current requirements summary
+    req_lines = []
+    for r in requirements:
+        req_lines.append(
+            f"- [{r.id}] ({r.type.value.upper()}) {r.title}: {r.statement} "
+            f"[Actor: {r.actor or 'Unspecified'} | Outcome: {r.outcome or 'Unspecified'}]"
+        )
+    reqs_str = "\n".join(req_lines) if req_lines else "No requirements extracted yet."
+
+    # Format open questions prioritized
+    sorted_qs = sorted(open_questions, key=lambda q: getattr(q, "priority", 0), reverse=True)
+    q_lines = []
+    for q in sorted_qs:
+        opts_str = f" Options: {q.options}" if q.options else ""
+        q_lines.append(
+            f"- [QUESTION_ID: {q.id}] (Priority: {q.priority}, Impact: {q.impact})\n"
+            f"  Question: {q.question_text}\n"
+            f"  Why it matters: {q.why_it_matters}\n"
+            f"  Target Field: {q.field_path}{opts_str}"
+        )
+    questions_str = "\n".join(q_lines) if q_lines else "None! All requirements are currently clear."
+
+    # Format source chunks if any
+    chunks_str = "None"
+    if chunks:
+        chunks_str = "\n".join(f"- [{c.id}]: {c.text[:200]}..." for c in chunks[:5])
+
+    # Format conversation history
+    history_lines = []
+    for h in history:
+        role = getattr(h, "role", None) or (h.get("role") if isinstance(h, dict) else "user")
+        content = getattr(h, "content", None) or (h.get("content") if isinstance(h, dict) else "")
+        history_lines.append(f"{str(role).upper()}: {content}")
+    history_str = "\n".join(history_lines) if history_lines else "No previous conversation history."
+
+    sample_qid = sorted_qs[0].id if sorted_qs else "Q-SAMPLE"
+
+    return f"""You are a helpful, expert Requirements Engineer and Lead Business Analyst conducting an interactive stakeholder discovery interview.
+Your goal is to converse naturally, answer user inquiries, and systematically resolve open requirement gaps so a complete, high-quality Business Requirements Document (BRD) can be generated.
+
+### PROJECT CONTEXT:
+- Title: {proj_title}
+- Status: {proj_status}
+- Business Idea:
+{proj_idea}
+
+### SOURCE DOCUMENTS (Grounding):
+{chunks_str}
+
+### CURRENT REQUIREMENTS:
+{reqs_str}
+
+### OPEN CLARIFICATION QUESTIONS (Prioritized):
+{questions_str}
+
+### CONVERSATION HISTORY:
+{history_str}
+
+### LATEST USER MESSAGE:
+USER: {new_message}
+
+### INSTRUCTIONS:
+1. Speak naturally, warmly, and concisely like Gemini or Claude. Be encouraging, professional, and clear.
+2. Analyze the LATEST USER MESSAGE in the context of the conversation:
+   - Does this message provide an answer to one of the OPEN CLARIFICATION QUESTIONS listed above?
+     - If YES:
+       - Set `answered_question_id` to the EXACT question ID (e.g. '{sample_qid}').
+       - Set `extracted_answer` to the concise, normalized answer value provided by the user.
+       - In `reply`, warmly acknowledge their answer, and then seamlessly introduce the NEXT highest-priority open question (if any questions remain).
+     - If NO:
+       - Set `answered_question_id` to null.
+       - Set `extracted_answer` to null.
+3. If the user is asking a question, asking for ideas, or asking for clarification on what you need:
+   - Answer their question thoroughly and helpfully using the project context.
+   - Then guide them to the next clarification gap that needs resolving.
+4. Focus on ONE question at a time so the user does not feel overwhelmed by a giant questionnaire.
+5. If NO open questions remain (or all have just been resolved):
+   - Set `answered_question_id` (if one was just answered, otherwise null).
+   - In `reply`, congratulate the user, summarize that all requirements and acceptance criteria are clear and validated, and let them know they can click 'Generate BRD' to produce the formal document!
+
+Output strictly conforming to the ChatTurnEvaluation JSON schema.
 """

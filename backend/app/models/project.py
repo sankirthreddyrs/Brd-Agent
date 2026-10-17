@@ -70,3 +70,11 @@ class Project(BaseModel):
         default=None,
         description="Email address of the project owner",
     )
+    collaborator_count: int = Field(
+        default=0,
+        description="Number of active collaborators on the project",
+    )
+    is_owner: bool = Field(
+        default=True,
+        description="Whether the active user is the project owner",
+    )
